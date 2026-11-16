@@ -4,8 +4,85 @@ pub mod events;
 pub mod observations;
 pub mod watches;
 
+use std::path::Path;
+
+use rusqlite::Connection;
+
 use crate::extract::{Availability, Source};
 use crate::money::Money;
+
+/// Migrations in order; migration N is `MIGRATIONS[N - 1]`.
+const MIGRATIONS: &[&str] = &[include_str!("../../migrations/001_init.sql")];
+
+/// How long SQLite waits on a locked database before giving up, in milliseconds.
+const BUSY_TIMEOUT_MS: i64 = 5000;
+
+/// Creates the table that records the last applied migration number.
+const CREATE_SCHEMA_VERSION_TABLE: &str =
+    "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)";
+
+/// Opens (creating if needed) the database at `path`, sets pragmas, applies pending migrations.
+///
+/// Returns `DbError::Sqlite` if the file cannot be opened, a pragma is rejected or a
+/// migration fails, and `DbError::Corrupt` if the stored schema version is newer than this
+/// binary knows about.
+pub fn open(path: &Path) -> Result<Connection, DbError> {
+    let mut connection = Connection::open(path)?;
+    connection.pragma_update(None, "journal_mode", "WAL")?;
+    connection.pragma_update(None, "foreign_keys", "ON")?;
+    connection.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS)?;
+    migrate(&mut connection)?;
+    Ok(connection)
+}
+
+/// Applies every migration newer than the stored schema version, each in its own transaction.
+///
+/// Returns `DbError::Corrupt` if the stored version is newer than `MIGRATIONS`.
+fn migrate(connection: &mut Connection) -> Result<(), DbError> {
+    connection.execute_batch(CREATE_SCHEMA_VERSION_TABLE)?;
+    let stored = stored_version(connection)?;
+    if stored > MIGRATIONS.len() {
+        return Err(DbError::Corrupt(format!(
+            "schema version {stored} is newer than this binary"
+        )));
+    }
+    for (index, sql) in MIGRATIONS.iter().enumerate().skip(stored) {
+        apply_migration(connection, index + 1, sql)?;
+    }
+    Ok(())
+}
+
+/// Returns the last applied migration number, or 0 if none has been applied.
+///
+/// Returns `DbError::Corrupt` if the stored number is negative.
+fn stored_version(connection: &Connection) -> Result<usize, DbError> {
+    let version: i64 = connection.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+        [],
+        |row| row.get(0),
+    )?;
+    usize::try_from(version).map_err(|_| {
+        DbError::Corrupt(format!(
+            "schema version {version} is not a valid version number"
+        ))
+    })
+}
+
+/// Runs migration `number` and records it as the schema version, in one transaction.
+///
+/// Returns `DbError::Sqlite` if the migration or the version update fails; the transaction
+/// is then rolled back and the version is left unchanged.
+fn apply_migration(connection: &mut Connection, number: usize, sql: &str) -> Result<(), DbError> {
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(sql)?;
+    transaction.execute("DELETE FROM schema_version", [])?;
+    transaction.execute(
+        "INSERT INTO schema_version (version) VALUES (?1)",
+        [number as i64],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
 
 /// Errors from the database layer.
 #[derive(Debug, thiserror::Error)]
