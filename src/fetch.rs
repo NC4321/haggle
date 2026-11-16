@@ -157,3 +157,176 @@ pub async fn fetch(
         validators,
     })
 }
+
+/// The product token matched against robots.txt User-agent lines.
+pub const ROBOTS_AGENT: &str = "haggle";
+
+/// Longest delay a failing watch is pushed back.
+pub const MAX_BACKOFF: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// Comment marker in robots.txt; the rest of the line is ignored.
+const COMMENT_MARKER: char = '#';
+
+/// Separator between a robots.txt field name and its value.
+const FIELD_SEPARATOR: char = ':';
+
+/// robots.txt field names, matched case-insensitively.
+const USER_AGENT_FIELD: &str = "user-agent";
+const ALLOW_FIELD: &str = "allow";
+const DISALLOW_FIELD: &str = "disallow";
+
+/// The User-agent value whose groups apply when no group names the agent.
+const WILDCARD_AGENT: &str = "*";
+
+/// Path pattern wildcard matching any run of characters.
+const WILDCARD: char = '*';
+
+/// Path pattern suffix anchoring the match to the end of the path.
+const END_ANCHOR: char = '$';
+
+/// One Allow or Disallow rule of a robots.txt group.
+struct RobotsRule {
+    allow: bool,
+    pattern: String,
+}
+
+/// A robots.txt group: the User-agent values it names and its rules.
+struct RobotsGroup {
+    agents: Vec<String>,
+    rules: Vec<RobotsRule>,
+}
+
+impl RobotsGroup {
+    /// Whether this group names `agent`, compared case-insensitively.
+    fn names(&self, agent: &str) -> bool {
+        self.agents
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(agent))
+    }
+}
+
+/// Splits robots.txt into groups, ignoring comments, unknown fields and empty rule values.
+///
+/// Consecutive User-agent lines share one group; a User-agent line after rules starts a new one.
+fn parse_groups(robots_txt: &str) -> Vec<RobotsGroup> {
+    let mut groups: Vec<RobotsGroup> = Vec::new();
+    let mut in_agent_run = false;
+    for line in robots_txt.lines() {
+        let content = line
+            .split_once(COMMENT_MARKER)
+            .map_or(line, |(before_comment, _)| before_comment);
+        let Some((field, value)) = content.split_once(FIELD_SEPARATOR) else {
+            continue;
+        };
+        let value = value.trim();
+        let name = field.trim().to_ascii_lowercase();
+        match name.as_str() {
+            USER_AGENT_FIELD => {
+                match groups.last_mut() {
+                    Some(group) if in_agent_run => group.agents.push(value.to_owned()),
+                    _ => groups.push(RobotsGroup {
+                        agents: vec![value.to_owned()],
+                        rules: Vec::new(),
+                    }),
+                }
+                in_agent_run = true;
+            }
+            ALLOW_FIELD | DISALLOW_FIELD => {
+                in_agent_run = false;
+                let Some(group) = groups.last_mut() else {
+                    continue;
+                };
+                if !value.is_empty() {
+                    group.rules.push(RobotsRule {
+                        allow: name == ALLOW_FIELD,
+                        pattern: value.to_owned(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    groups
+}
+
+/// The rules that apply to `agent`: those of the groups naming it, else those of the wildcard groups.
+///
+/// Returns an empty list when no group applies.
+fn applicable_rules<'a>(groups: &'a [RobotsGroup], agent: &str) -> Vec<&'a RobotsRule> {
+    let named: Vec<&RobotsGroup> = groups.iter().filter(|group| group.names(agent)).collect();
+    let selected = if named.is_empty() {
+        groups
+            .iter()
+            .filter(|group| group.names(WILDCARD_AGENT))
+            .collect()
+    } else {
+        named
+    };
+    selected
+        .into_iter()
+        .flat_map(|group| group.rules.iter())
+        .collect()
+}
+
+/// Whether a robots.txt `pattern` matches the start of `path`.
+///
+/// `*` matches any run of characters; a trailing `$` requires the match to reach the end of `path`.
+fn pattern_matches(pattern: &str, path: &str) -> bool {
+    let (body, anchored) = match pattern.strip_suffix(END_ANCHOR) {
+        Some(body) => (body, true),
+        None => (pattern, false),
+    };
+    let segments: Vec<&str> = body.split(WILDCARD).collect();
+    match segments.as_slice() {
+        // `split` always yields at least one segment, so this arm only satisfies the match.
+        [] => false,
+        [whole] if anchored => path == *whole,
+        [whole] => path.starts_with(*whole),
+        [first, middle @ .., last] => {
+            let Some(mut rest) = path.strip_prefix(*first) else {
+                return false;
+            };
+            for &segment in middle {
+                let Some(index) = rest.find(segment) else {
+                    return false;
+                };
+                rest = &rest[index + segment.len()..];
+            }
+            if anchored {
+                rest.ends_with(*last)
+            } else {
+                rest.contains(*last)
+            }
+        }
+    }
+}
+
+/// Whether `path` (path plus optional ?query of a URL) may be fetched by `agent` under `robots_txt`.
+///
+/// Follows RFC 9309: groups naming `agent` are used, else the `*` groups, else everything is allowed.
+/// Among the rules matching `path`, the longest pattern wins and Allow wins a tie.
+/// Returns `true` when no rule matches.
+pub fn robots_allows(robots_txt: &str, agent: &str, path: &str) -> bool {
+    let groups = parse_groups(robots_txt);
+    applicable_rules(&groups, agent)
+        .into_iter()
+        .filter(|rule| pattern_matches(&rule.pattern, path))
+        .max_by_key(|rule| (rule.pattern.len(), rule.allow))
+        .is_none_or(|rule| rule.allow)
+}
+
+/// Delay before the next check after `failures` consecutive failures.
+///
+/// `interval` doubled `failures` times, capped at `MAX_BACKOFF`, and never below `interval`:
+/// `interval` itself when `failures` is 0. Saturates instead of overflowing.
+pub fn backoff_delay(interval: Duration, failures: u32) -> Duration {
+    let mut delay = interval;
+    for _ in 0..failures {
+        // Stop once capped; a zero interval never grows and would otherwise loop for every failure.
+        if delay >= MAX_BACKOFF || delay.is_zero() {
+            break;
+        }
+        delay = delay.saturating_mul(2);
+    }
+    delay.min(MAX_BACKOFF).max(interval)
+}
