@@ -156,19 +156,19 @@ CI: off (the board's full check is the gate)
 
 Goal: `haggle check URL` prints the price, currency, availability and where it found them.
 Depends on: none
-- [ ] Cargo project, `Makefile` targets, `rustfmt.toml`, `.gitignore`, in `Cargo.toml`, `Makefile`
-- [ ] Error enums and exit codes, in `src/main.rs` and each module
-- [ ] `Money`, currency codes and price-string parsing, in `src/money.rs`
-- [ ] JSON-LD extractor (`Product`, `Offer`, `AggregateOffer`, `@graph`), in `src/extract/jsonld.rs`
-- [ ] Meta-tag extractor, in `src/extract/meta.rs`
-- [ ] Microdata extractor, in `src/extract/microdata.rs`
-- [ ] CSS-selector extractor, in `src/extract/selector.rs`
-- [ ] The ordered extraction chain, in `src/extract/mod.rs`
-- [ ] HTTP fetch with size limit, timeout and User-Agent, in `src/fetch.rs`
-- [ ] `check` subcommand, in `src/cli.rs`
-- [ ] Test: price strings in US, European and bare formats parse to the right minor units, in `src/money.rs`
-- [ ] Test: each extractor against at least three saved pages, in `tests/extract.rs`, `tests/fixtures/`
-- [ ] Test: a page with no price returns `NoPrice`, not a guess, in `tests/extract.rs`
+- [ ] Cargo project, `Makefile` targets, `rustfmt.toml`, `.gitignore`, in `Cargo.toml`, `Makefile` (#1)
+- [ ] Error enums and exit codes, in `src/main.rs` and each module (#2)
+- [ ] `Money`, currency codes and price-string parsing, in `src/money.rs` (#3)
+- [ ] JSON-LD extractor (`Product`, `Offer`, `AggregateOffer`, `@graph`), in `src/extract/jsonld.rs` (#4)
+- [ ] Meta-tag extractor, in `src/extract/meta.rs` (#5)
+- [ ] Microdata extractor, in `src/extract/microdata.rs` (#6)
+- [ ] CSS-selector extractor, in `src/extract/selector.rs` (#7)
+- [ ] The ordered extraction chain, in `src/extract/mod.rs` (#8)
+- [ ] HTTP fetch with size limit, timeout and User-Agent, in `src/fetch.rs` (#9)
+- [ ] `check` subcommand, in `src/cli.rs` (#10)
+- [ ] Test: price strings in US, European and bare formats parse to the right minor units, in `src/money.rs` (#11)
+- [ ] Test: each extractor against at least three saved pages, in `tests/extract.rs`, `tests/fixtures/` (#12)
+- [ ] Test: a page with no price returns `NoPrice`, not a guess, in `tests/extract.rs` (#13)
 
 Done when: `make check` passes and `haggle check` on each fixture served locally prints the expected price.
 
