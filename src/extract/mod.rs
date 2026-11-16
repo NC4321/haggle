@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use scraper::Html;
+
 use crate::money::Money;
 
 pub mod jsonld;
@@ -99,11 +101,43 @@ pub enum ExtractError {
     BadSelector(String),
 }
 
+/// An extractor that reads a price from a parsed page.
+type DocumentExtractor = fn(&Html) -> Result<Extraction, ExtractError>;
+
+/// Structured-data extractors, in the order they are tried.
+const STRUCTURED_EXTRACTORS: [DocumentExtractor; 3] =
+    [jsonld::extract, meta::extract, microdata::extract];
+
 /// Extracts the product price from `html`, trying the extractors in order.
 ///
+/// Structured data (JSON-LD, meta tags, microdata) is tried before the user's
+/// CSS selector, and the first extractor that succeeds wins. The page text is
+/// never used as a price source.
+///
 /// `selector` is an optional user CSS selector for the price element.
-/// Returns `ExtractError` when no price is found, the page states several
-/// different prices, or the selector is invalid.
-pub fn extract(_html: &str, _selector: Option<&str>) -> Result<Extraction, ExtractError> {
-    unimplemented!("extract")
+/// Returns `ExtractError::BadSelector` when the selector does not parse,
+/// `ExtractError::AmbiguousPrice` when some extractor found several different
+/// prices and none succeeded, and `ExtractError::NoPrice` otherwise.
+pub fn extract(html: &str, selector: Option<&str>) -> Result<Extraction, ExtractError> {
+    let doc = Html::parse_document(html);
+    let structured = STRUCTURED_EXTRACTORS
+        .iter()
+        .map(|extractor| extractor(&doc));
+    let css = selector
+        .into_iter()
+        .map(|css_selector| selector::extract(&doc, css_selector));
+    let mut saw_ambiguous = false;
+    for attempt in structured.chain(css) {
+        match attempt {
+            Ok(extraction) => return Ok(extraction),
+            Err(error @ ExtractError::BadSelector(_)) => return Err(error),
+            Err(ExtractError::AmbiguousPrice) => saw_ambiguous = true,
+            Err(ExtractError::NoPrice) => {}
+        }
+    }
+    if saw_ambiguous {
+        Err(ExtractError::AmbiguousPrice)
+    } else {
+        Err(ExtractError::NoPrice)
+    }
 }
