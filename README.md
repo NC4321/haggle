@@ -16,7 +16,7 @@ What it demonstrates:
 - being a polite client: robots.txt, per-host rate limits, conditional requests, backoff,
 - money handled as integer minor units with a currency, never floating point,
 - a discount judged against the price history Haggle observed, not the shop's own "was" price,
-- one static Rust binary with an embedded SQLite database and a server-rendered UI.
+- one self-contained Rust binary with an embedded SQLite database and a server-rendered UI.
 
 ## Features
 
@@ -30,8 +30,8 @@ All features are planned.
 
 ## Requirements
 
-- Rust (stable), to build.
-- Linux x86-64, to run. The release build is a static musl binary.
+- Rust (stable, through rustup) and a C compiler (`build-essential` on Ubuntu), to build.
+- Linux x86-64, to run. It is built and run on the same machine (hp-server).
 - An ntfy topic, for notifications (optional).
 
 ## Quick start

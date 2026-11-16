@@ -7,7 +7,7 @@ A self-hosted price and stock watcher. You give it a product URL; it checks the 
 ## Decisions
 
 - Purpose? → GitHub portfolio piece (full-stack product) and a tool for daily personal use: buying homelab, hobby and work items at their lowest price.
-- Language? → Rust (stable, edition 2024). One static binary, no runtime to install on the server.
+- Language? → Rust (stable, edition 2024). One self-contained binary (SQLite compiled in); the server needs the Rust toolchain to build it and nothing extra to run it.
 - Host? → `hp-server` (hostname `apollo`, 192.168.5.21, Ubuntu 24.04, x86-64, glibc 2.39), as a systemd service running as user `vette`.
 - Database? → SQLite, one file at `/mnt/database/haggle/haggle.db` on hp-server. This is the only persistent database. The folder is created once by hand (`sudo mkdir /mnt/database/haggle && sudo chown vette:vette /mnt/database/haggle`). Haggle never reads or writes any other folder under `/mnt/database`.
 - Test and demo data? → throwaway SQLite files in a temp directory, deleted afterwards. Tests and `make demo` never open the live database, and refuse to start if `HAGGLE_DB` points under `/mnt/database`.
@@ -19,7 +19,8 @@ A self-hosted price and stock watcher. You give it a product URL; it checks the 
 - Web UI? → server-rendered HTML with htmx for the few interactive parts. Charts are SVG drawn on the server. No Node toolchain and no JavaScript build.
 - Access control? → none. The service binds to the LAN address and is not exposed to the internet.
 - Port? → 8421 (22, 80, 3000, 4747, 8000, 8080 and 8787 are already in use on hp-server).
-- Deploy? → built on the workstation for `x86_64-unknown-linux-musl` (static, so the workstation's newer glibc does not matter), copied with `scp`, run by systemd.
+- Build and deploy? → built on hp-server itself, from a git checkout at `~/src/haggle`, with a normal glibc release build (`x86_64-unknown-linux-gnu`). It is built against the server's own glibc 2.39, so no musl target and no copying between machines. Installed to `/usr/local/bin/haggle`, run by systemd.
+- Server toolchain? → `build-essential` and `git` from apt; Rust stable through rustup, installed for user `vette` in `~/.cargo` (Ubuntu's apt `rustc` is too old for edition 2024).
 - Workflow? → solo.
 - CI? → none. No workflow files.
 
@@ -128,7 +129,7 @@ Each line: what was chosen · the alternative · why.
 - `extract` and `rules` pure · mixed with I/O · they are the logic most likely to be wrong, and pure functions are tested with fixtures and no network.
 - Server-rendered HTML and SVG · a React front end · the UI is five pages; a second toolchain would outweigh it.
 - Discount measured against observed history · trusting the shop's "was" price · the shop's reference price is the thing being checked.
-- Static musl build · building on the server · the server has no Rust toolchain and should not need one.
+- Build on hp-server · a static musl build on the workstation, copied with `scp` · one machine to build, test and run on; the binary always matches the server's glibc, and no musl C toolchain is needed. The cost is a Rust toolchain on the server and slower first builds on the i5-8500T.
 
 ## Conventions
 
@@ -137,11 +138,12 @@ Format: `cargo fmt --all --check`
 Lint: `cargo clippy --all-targets -- -D warnings`
 CI: off (the board's full check is the gate)
 
-- Build: `make build` (`cargo build --release --target x86_64-unknown-linux-musl`).
+- Build: `make build` (`cargo build --release`).
 - Test: `make test` (`cargo test`). A single test: `cargo test <name>`.
 - Full check: `make check` (format check, lint, build, tests).
 - Demo: `make demo` (`haggle demo`).
-- Deploy: `make deploy` (copies the binary and unit files to hp-server; does not restart anything by itself).
+- Install: `make install`, run on hp-server (copies `target/release/haggle` to `/usr/local/bin/` and the unit files to `/etc/systemd/system/`, runs `systemctl daemon-reload`; uses sudo; does not restart anything by itself).
+- Update: `git pull && make check && make install`, then `sudo systemctl restart haggle`.
 - Tests: extraction is tested against saved pages in `tests/fixtures/`, each with its expected price written by hand, never taken from the extractor's own output. Fetch tests run against a local test server. No test touches the internet or the live database.
 - Naming: standard Rust (snake_case functions, PascalCase types). SQL identifiers are snake_case.
 - Comments: a `//!` header on every module, `///` on every public item, inline comments only for the why.
@@ -210,8 +212,8 @@ Goal: Haggle watches real items from the homelab.
 Depends on: M3
 - [ ] systemd unit with `ReadWritePaths=/mnt/database/haggle` and an environment file, in `deploy/haggle.service`
 - [ ] Daily backup (`VACUUM INTO`, seven kept) to `/mnt/database/haggle/backups/`, in `deploy/haggle-backup.service`, `deploy/haggle-backup.timer`
-- [ ] `make deploy` target, in `Makefile`
-- [ ] Install and update guide, including the one-time folder creation, in `deploy/README.md`
+- [ ] `make install` target, in `Makefile`
+- [ ] Install and update guide, including the toolchain setup (apt packages, rustup) and the one-time folder creation, in `deploy/README.md`
 - [ ] Extraction and scheduling design notes, in `docs/design/`
 - [ ] README screenshots and demo GIF, in `media/`
 
@@ -230,6 +232,6 @@ Done when: the service has run on hp-server for 48 hours, has stored observation
 
 - Many large shops block non-browser clients or hide prices behind JavaScript. Haggle will not work for those; the README must say which kinds of shop work and show the `needs-selector` and `blocked` states plainly.
 - A shop's terms may forbid automated access. The polite defaults lower the load but do not change the terms; the README says so.
-- The static musl build of bundled SQLite needs a musl C toolchain on the workstation (`musl` package). If that proves awkward, the fallback is building in an Ubuntu 24.04 container.
+- Building on an 8 GB, 6-core server: the first release build (tokio, axum, reqwest, bundled SQLite) takes several minutes and uses a few GB of RAM while other services run. If memory gets tight, limit parallel jobs with `cargo build -j 2`.
 - `/mnt/database` is owned by root, so creating `/mnt/database/haggle` needs sudo once, by the user.
 - Whether ntfy is self-hosted or the public ntfy.sh is not decided; the code only needs a URL.
