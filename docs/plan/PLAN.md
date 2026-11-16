@@ -134,6 +134,7 @@ Each line: what was chosen · the alternative · why.
 ## Conventions
 
 Workflow: solo
+Guardrails: set (squash merges only, merged branches deleted, the base branch reached only through pull requests)
 Format: `cargo fmt --all --check`
 Lint: `cargo clippy --all-targets -- -D warnings`
 CI: off (the board's full check is the gate)
@@ -155,21 +156,22 @@ CI: off (the board's full check is the gate)
 
 Goal: `haggle check URL` prints the price, currency, availability and where it found them.
 Depends on: none
-- [ ] Cargo project, `Makefile` targets, `rustfmt.toml`, `.gitignore`, in `Cargo.toml`, `Makefile`
-- [ ] Error enums and exit codes, in `src/main.rs` and each module
-- [ ] `Money`, currency codes and price-string parsing, in `src/money.rs`
-- [ ] JSON-LD extractor (`Product`, `Offer`, `AggregateOffer`, `@graph`), in `src/extract/jsonld.rs`
-- [ ] Meta-tag extractor, in `src/extract/meta.rs`
-- [ ] Microdata extractor, in `src/extract/microdata.rs`
-- [ ] CSS-selector extractor, in `src/extract/selector.rs`
-- [ ] The ordered extraction chain, in `src/extract/mod.rs`
-- [ ] HTTP fetch with size limit, timeout and User-Agent, in `src/fetch.rs`
-- [ ] `check` subcommand, in `src/cli.rs`
-- [ ] Test: price strings in US, European and bare formats parse to the right minor units, in `src/money.rs`
-- [ ] Test: each extractor against at least three saved pages, in `tests/extract.rs`, `tests/fixtures/`
-- [ ] Test: a page with no price returns `NoPrice`, not a guess, in `tests/extract.rs`
+- [x] Cargo project, `Makefile` targets, `rustfmt.toml`, `.gitignore`, in `Cargo.toml`, `Makefile` (#1)
+- [x] Error enums and exit codes, in `src/main.rs` and each module (#2)
+- [x] `Money`, currency codes and price-string parsing, in `src/money.rs` (#3)
+- [x] JSON-LD extractor (`Product`, `Offer`, `AggregateOffer`, `@graph`), in `src/extract/jsonld.rs` (#4)
+- [x] Meta-tag extractor, in `src/extract/meta.rs` (#5)
+- [x] Microdata extractor, in `src/extract/microdata.rs` (#6)
+- [x] CSS-selector extractor, in `src/extract/selector.rs` (#7)
+- [x] The ordered extraction chain, in `src/extract/mod.rs` (#8)
+- [x] HTTP fetch with size limit, timeout and User-Agent, in `src/fetch.rs` (#9)
+- [x] `check` subcommand, in `src/cli.rs` (#10)
+- [x] Test: price strings in US, European and bare formats parse to the right minor units, in `src/money.rs` (#11)
+- [x] Test: each extractor against at least three saved pages, in `tests/extract.rs`, `tests/fixtures/` (#12)
+- [x] Test: a page with no price returns `NoPrice`, not a guess, in `tests/extract.rs` (#13)
 
 Done when: `make check` passes and `haggle check` on each fixture served locally prints the expected price.
+Note: The price-parsing tests live in tests/money.rs instead of src/money.rs, so a tester writes them. Extractor tests are split per extractor (tests/extract_*.rs), and tests/extract.rs covers the chain. `check` takes a URL only; IDs come with the database in M2.
 
 ### M2 · Watch, remember, notify
 
