@@ -19,7 +19,7 @@ A self-hosted price and stock watcher. You give it a product URL; it checks the 
 - Web UI? → server-rendered HTML with htmx for the few interactive parts. Charts are SVG drawn on the server. No Node toolchain and no JavaScript build.
 - Access control? → none. The service binds to the LAN address and is not exposed to the internet.
 - Port? → 8421 (22, 80, 3000, 4747, 8000, 8080 and 8787 are already in use on hp-server).
-- Build and deploy? → built on hp-server itself, from a git checkout at `~/src/haggle`, with a normal glibc release build (`x86_64-unknown-linux-gnu`). It is built against the server's own glibc 2.39, so no musl target and no copying between machines. Installed to `/usr/local/bin/haggle`, run by systemd.
+- Build and deploy? → built on hp-server itself, from a git checkout at `~/Projects/haggle`, with a normal glibc release build (`x86_64-unknown-linux-gnu`). It is built against the server's own glibc 2.39, so no musl target and no copying between machines. Installed to `/usr/local/bin/haggle`, run by systemd.
 - Server toolchain? → `build-essential` and `git` from apt; Rust stable through rustup, installed for user `vette` in `~/.cargo` (Ubuntu's apt `rustc` is too old for edition 2024).
 - Workflow? → solo.
 - CI? → none. No workflow files.
