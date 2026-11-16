@@ -177,18 +177,18 @@ Note: The price-parsing tests live in tests/money.rs instead of src/money.rs, so
 
 Goal: watches are checked on a schedule and a price drop sends one notification.
 Depends on: M1
-- [ ] Database open, pragmas (WAL, foreign keys) and embedded migrations, in `src/db/mod.rs`, `migrations/`
-- [ ] Watches, observations and events queries, in `src/db/`
-- [ ] Guard that refuses a `/mnt/database` path in tests and the demo, in `src/config.rs`
-- [ ] robots.txt cache, per-host limiter, conditional GET and backoff, in `src/fetch.rs`
-- [ ] Event rules: drop, rise, target hit, lowest ever, stock changes, inflated sale, in `src/rules.rs`
-- [ ] ntfy client, in `src/notify.rs`
-- [ ] Scheduler loop with jitter and graceful shutdown, in `src/scheduler.rs`
-- [ ] `add`, `ls`, `history`, `rm` and `serve` subcommands, in `src/cli.rs`
-- [ ] Test: each rule against a hand-written history, in `src/rules.rs`
-- [ ] Test: the same event is never notified twice, including after a restart, in `tests/scheduler.rs`
-- [ ] Test: a 429 response pushes the next check back and stops requests to that host, in `tests/fetch.rs`
-- [ ] Test: a robots.txt disallow marks the watch `blocked` and sends no request, in `tests/fetch.rs`
+- [ ] Database open, pragmas (WAL, foreign keys) and embedded migrations, in `src/db/mod.rs`, `migrations/` (#15)
+- [ ] Watches, observations and events queries, in `src/db/` (#16)
+- [ ] Guard that refuses a `/mnt/database` path in tests and the demo, in `src/config.rs` (#17)
+- [ ] robots.txt cache, per-host limiter, conditional GET and backoff, in `src/fetch.rs` (#18)
+- [ ] Event rules: drop, rise, target hit, lowest ever, stock changes, inflated sale, in `src/rules.rs` (#19)
+- [ ] ntfy client, in `src/notify.rs` (#20)
+- [ ] Scheduler loop with jitter and graceful shutdown, in `src/scheduler.rs` (#21)
+- [ ] `add`, `ls`, `history`, `rm` and `serve` subcommands, in `src/cli.rs` (#22)
+- [ ] Test: each rule against a hand-written history, in `src/rules.rs` (#23)
+- [ ] Test: the same event is never notified twice, including after a restart, in `tests/scheduler.rs` (#24)
+- [ ] Test: a 429 response pushes the next check back and stops requests to that host, in `tests/fetch.rs` (#25)
+- [ ] Test: a robots.txt disallow marks the watch `blocked` and sends no request, in `tests/fetch.rs` (#26)
 
 Done when: `make check` passes and, against a local test shop, a scripted price drop produces exactly one ntfy request.
 
