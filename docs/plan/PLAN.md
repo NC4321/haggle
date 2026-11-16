@@ -134,6 +134,7 @@ Each line: what was chosen · the alternative · why.
 ## Conventions
 
 Workflow: solo
+Guardrails: set (squash merges only, merged branches deleted, the base branch reached only through pull requests)
 Format: `cargo fmt --all --check`
 Lint: `cargo clippy --all-targets -- -D warnings`
 CI: off (the board's full check is the gate)
