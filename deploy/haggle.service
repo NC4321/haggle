@@ -2,7 +2,7 @@
 # `make install` copies this file to /etc/systemd/system/.
 # The service reads its settings from /etc/haggle/haggle.env, which holds
 # HAGGLE_DB, HAGGLE_LISTEN, HAGGLE_NTFY_URL and the secret HAGGLE_NTFY_TOKEN.
-# Keep that file readable only by root and the haggle user.
+# Keep that file owned by root with mode 600; systemd reads it before switching to the haggle user.
 
 [Unit]
 Description=Haggle price watcher
