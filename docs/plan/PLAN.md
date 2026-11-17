@@ -49,7 +49,7 @@ A self-hosted price and stock watcher. You give it a product URL; it checks the 
 - `src/notify.rs`: ntfy client.
 - `src/scheduler.rs`: picks due watches, runs fetch → extract → store → rules → notify.
 - `src/db/`: `mod.rs` (open, pragmas, migrations), `watches.rs`, `observations.rs`, `events.rs`.
-- `src/web/`: `mod.rs` (router), `pages.rs` (dashboard, watch detail, add form), `chart.rs` (price history as SVG).
+- `src/web/`: `mod.rs` (`AppState`, `WebError`, router, `serve`, shared formatting helpers), `pages.rs` (dashboard), `watch_page.rs` (watch detail and its edit, pause and delete forms), `add_page.rs` (add form with preview), `chart.rs` (price history as SVG; pure).
 - `src/demo_shop.rs`: a fake shop served on localhost whose prices and stock follow a scripted timeline.
 
 ### Interfaces
@@ -76,6 +76,20 @@ pub async fn fetch(client: &Fetcher, url: &Url, previous: Option<&Validators>) -
 pub enum Fetched { Body { html: String, validators: Validators }, NotModified }
 ```
 
+Web (src/web/mod.rs):
+
+```rust
+#[derive(Clone)]
+pub struct AppState { pub db: Arc<std::sync::Mutex<rusqlite::Connection>>, pub fetcher: Arc<Fetcher> }
+pub fn router(state: AppState) -> axum::Router;
+pub async fn serve(listener: tokio::net::TcpListener, state: AppState, shutdown: impl Future<Output = ()> + Send + 'static) -> std::io::Result<()>;
+pub enum WebError { Db(DbError), NotFound, BadRequest(String), Render(askama::Error) }  // IntoResponse: 500, 404, 400, 500
+pub fn price_chart(history: &[Observation], target: Option<&Money>, width: u32, height: u32) -> String;  // chart.rs
+pub fn sparkline(history: &[Observation], width: u32, height: u32) -> String;  // chart.rs
+```
+
+Routes: `GET /` dashboard · `GET /watches/{id}` detail · `POST /watches/{id}` edit target and interval · `POST /watches/{id}/pause` toggle enabled · `POST /watches/{id}/delete` · `GET /add` form · `POST /add/preview` fetch and show the extraction · `POST /add` create · `GET /static/style.css`. All POSTs answer 303 See Other to the page to show next.
+
 Database tables:
 
 - `watches`: id, url (unique), name, selector, target_minor, currency, interval_s, enabled, status (`ok`, `needs-selector`, `blocked`, `error`), etag, last_modified, next_check_at, failures, created_at.
@@ -92,6 +106,7 @@ Scheduler tick → due watches (ordered by `next_check_at`) → per-host limiter
 - One `Error` enum (thiserror) per layer: `ExtractError` (`NoPrice`, `AmbiguousPrice`, `BadSelector`), `FetchError` (`Blocked` for robots.txt or 403, `RateLimited`, `Http(status)`, `Network`, `TooLarge`), `DbError`, `ConfigError`, `NotifyError`.
 - A failed check never stops the scheduler. It is recorded on the watch (`status`, `failures`) and the next check is pushed back.
 - A failed notification leaves `notified_at` empty, so it is retried on the next tick.
+- The web layer: one `WebError`; the scheduler and the web UI each hold their own database connection (WAL lets them share the file).
 - `main` prints `ConfigError` to stderr and exits 2; any other error exits 1.
 - Logging: `tracing` to stderr, level from `--log-level`; journald collects it under systemd.
 
@@ -130,6 +145,7 @@ Each line: what was chosen · the alternative · why.
 - Server-rendered HTML and SVG · a React front end · the UI is five pages; a second toolchain would outweigh it.
 - Discount measured against observed history · trusting the shop's "was" price · the shop's reference price is the thing being checked.
 - Build on hp-server · a static musl build on the workstation, copied with `scp` · one machine to build, test and run on; the binary always matches the server's glibc, and no musl C toolchain is needed. The cost is a Rust toolchain on the server and slower first builds on the i5-8500T.
+- Plain HTML forms in M3 · htmx · every page works with full reloads; the vendored htmx script is left out until a page needs partial updates.
 
 ## Conventions
 
