@@ -2,10 +2,18 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use haggle::config::{Config, ConfigError, DEFAULT_LISTEN, LIVE_DB_ROOT, ensure_scratch_path};
+use haggle::config::{
+    Config, ConfigError, DEFAULT_LISTEN, LIVE_DB_ROOT, SMTP_HOST, SMTP_PORT, ensure_scratch_path,
+};
 
 const DB: (&str, &str) = ("HAGGLE_DB", "/var/lib/haggle/haggle.db");
-const NTFY_URL: &str = "https://ntfy.example.com/haggle";
+const USER: (&str, &str) = ("GMAIL_USER", "haggle@example.com");
+const APP_PASSWORD: (&str, &str) = ("GMAIL_APP_PASSWORD", SECRET);
+const ALERT: (&str, &str) = ("ALERT_EMAIL", "me@example.com");
+
+/// The Gmail app password used in the email tests. It must never appear in an error or a Debug
+/// output.
+const SECRET: &str = "s3cret-app-pass";
 
 /// Builds a config from `pairs`, standing in for the process environment.
 fn config_from(pairs: &[(&str, &str)]) -> Result<Config, ConfigError> {
@@ -70,11 +78,21 @@ fn live_database_root_is_mnt_database() {
 }
 
 #[test]
-fn only_database_path_gives_default_listen_and_no_ntfy() {
+fn smtp_host_is_gmail() {
+    assert_eq!(SMTP_HOST, "smtp.gmail.com");
+}
+
+#[test]
+fn smtp_port_is_587() {
+    assert_eq!(SMTP_PORT, 587);
+}
+
+#[test]
+fn only_database_path_gives_default_listen_and_no_email() {
     let config = config_ok(&[DB]);
     assert_eq!(config.db_path, PathBuf::from("/var/lib/haggle/haggle.db"));
     assert_eq!(config.listen, SocketAddr::from(([127, 0, 0, 1], 8421)));
-    assert!(config.ntfy.is_none());
+    assert!(config.email.is_none());
 }
 
 #[test]
@@ -151,119 +169,149 @@ fn listen_with_a_host_name_is_invalid() {
 }
 
 #[test]
-fn https_ntfy_url_and_token_are_both_kept() {
+fn all_three_email_variables_give_the_email_settings() {
+    let config = config_ok(&[DB, USER, APP_PASSWORD, ALERT]);
+    let email = config.email.expect("email is configured");
+    assert_eq!(email.user, "haggle@example.com");
+    assert_eq!(email.password, SECRET);
+    assert_eq!(email.to, "me@example.com");
+}
+
+#[test]
+fn email_values_are_trimmed() {
     let config = config_ok(&[
         DB,
-        ("HAGGLE_NTFY_URL", NTFY_URL),
-        ("HAGGLE_NTFY_TOKEN", "tok-abc"),
+        ("GMAIL_USER", " haggle@example.com "),
+        ("GMAIL_APP_PASSWORD", " s3cret-app-pass\t"),
+        ("ALERT_EMAIL", "me@example.com  "),
     ]);
-    let ntfy = config.ntfy.expect("ntfy is configured");
-    assert_eq!(ntfy.url.as_str(), NTFY_URL);
-    assert_eq!(ntfy.token.as_deref(), Some("tok-abc"));
+    let email = config.email.expect("email is configured");
+    assert_eq!(email.user, "haggle@example.com");
+    assert_eq!(email.password, SECRET);
+    assert_eq!(email.to, "me@example.com");
 }
 
 #[test]
-fn http_ntfy_url_is_accepted() {
-    let config = config_ok(&[DB, ("HAGGLE_NTFY_URL", "http://127.0.0.1:8080/haggle")]);
-    let ntfy = config.ntfy.expect("ntfy is configured");
-    assert_eq!(ntfy.url.as_str(), "http://127.0.0.1:8080/haggle");
-    assert!(ntfy.token.is_none());
-}
-
-#[test]
-fn ntfy_url_with_ftp_scheme_is_invalid() {
+fn missing_gmail_user_is_reported_by_name() {
     assert_eq!(
-        config_err(&[DB, ("HAGGLE_NTFY_URL", "ftp://ntfy.example.com/haggle")]),
-        invalid(
-            "HAGGLE_NTFY_URL",
-            "ftp://ntfy.example.com/haggle",
-            "not an http(s) URL"
-        )
+        config_err(&[DB, APP_PASSWORD, ALERT]),
+        ConfigError::Missing("GMAIL_USER")
     );
 }
 
 #[test]
-fn ntfy_url_without_a_scheme_is_invalid() {
+fn missing_app_password_is_reported_by_name() {
     assert_eq!(
-        config_err(&[DB, ("HAGGLE_NTFY_URL", "ntfy.example.com/haggle")]),
-        invalid(
-            "HAGGLE_NTFY_URL",
-            "ntfy.example.com/haggle",
-            "not an http(s) URL"
-        )
+        config_err(&[DB, USER, ALERT]),
+        ConfigError::Missing("GMAIL_APP_PASSWORD")
     );
 }
 
 #[test]
-fn empty_ntfy_url_leaves_ntfy_unset() {
-    assert!(config_ok(&[DB, ("HAGGLE_NTFY_URL", "")]).ntfy.is_none());
-}
-
-#[test]
-fn whitespace_only_ntfy_url_leaves_ntfy_unset() {
-    assert!(config_ok(&[DB, ("HAGGLE_NTFY_URL", "   ")]).ntfy.is_none());
-}
-
-#[test]
-fn token_without_url_leaves_ntfy_unset() {
-    assert!(
-        config_ok(&[DB, ("HAGGLE_NTFY_TOKEN", "tok-abc")])
-            .ntfy
-            .is_none()
+fn missing_alert_email_is_reported_by_name() {
+    assert_eq!(
+        config_err(&[DB, USER, APP_PASSWORD]),
+        ConfigError::Missing("ALERT_EMAIL")
     );
 }
 
 #[test]
-fn empty_token_with_url_leaves_token_unset() {
-    let config = config_ok(&[DB, ("HAGGLE_NTFY_URL", NTFY_URL), ("HAGGLE_NTFY_TOKEN", "")]);
-    let ntfy = config.ntfy.expect("ntfy is configured");
-    assert!(ntfy.token.is_none());
+fn when_several_email_variables_are_missing_the_first_in_order_is_reported() {
+    // GMAIL_USER comes first in the order GMAIL_USER, GMAIL_APP_PASSWORD, ALERT_EMAIL.
+    assert_eq!(config_err(&[DB, ALERT]), ConfigError::Missing("GMAIL_USER"));
 }
 
 #[test]
-fn whitespace_only_token_with_url_leaves_token_unset() {
+fn blank_email_variables_all_count_as_unset() {
     let config = config_ok(&[
         DB,
-        ("HAGGLE_NTFY_URL", NTFY_URL),
-        ("HAGGLE_NTFY_TOKEN", "  "),
+        ("GMAIL_USER", ""),
+        ("GMAIL_APP_PASSWORD", "  "),
+        ("ALERT_EMAIL", " "),
     ]);
-    let ntfy = config.ntfy.expect("ntfy is configured");
-    assert!(ntfy.token.is_none());
+    assert!(config.email.is_none());
 }
 
 #[test]
-fn debug_output_of_config_does_not_show_the_token() {
-    let config = config_ok(&[
-        DB,
-        ("HAGGLE_NTFY_URL", NTFY_URL),
-        ("HAGGLE_NTFY_TOKEN", "s3cret"),
-    ]);
+fn blank_app_password_beside_the_other_email_variables_is_missing() {
+    assert_eq!(
+        config_err(&[DB, USER, ("GMAIL_APP_PASSWORD", " "), ALERT]),
+        ConfigError::Missing("GMAIL_APP_PASSWORD")
+    );
+}
+
+#[test]
+fn alert_email_without_an_at_sign_is_invalid() {
+    assert_eq!(
+        config_err(&[DB, USER, APP_PASSWORD, ("ALERT_EMAIL", "not-an-address")]),
+        invalid("ALERT_EMAIL", "not-an-address", "not an email address")
+    );
+}
+
+#[test]
+fn gmail_user_with_whitespace_is_invalid() {
+    assert_eq!(
+        config_err(&[DB, ("GMAIL_USER", "a b@c"), APP_PASSWORD, ALERT]),
+        invalid("GMAIL_USER", "a b@c", "not an email address")
+    );
+}
+
+#[test]
+fn alert_email_with_two_at_signs_is_invalid() {
+    assert_eq!(
+        config_err(&[DB, USER, APP_PASSWORD, ("ALERT_EMAIL", "a@b@example.com")]),
+        invalid("ALERT_EMAIL", "a@b@example.com", "not an email address")
+    );
+}
+
+#[test]
+fn gmail_user_with_an_empty_local_part_is_invalid() {
+    assert_eq!(
+        config_err(&[DB, ("GMAIL_USER", "@example.com"), APP_PASSWORD, ALERT]),
+        invalid("GMAIL_USER", "@example.com", "not an email address")
+    );
+}
+
+#[test]
+fn alert_email_with_an_empty_domain_is_invalid() {
+    assert_eq!(
+        config_err(&[DB, USER, APP_PASSWORD, ("ALERT_EMAIL", "me@")]),
+        invalid("ALERT_EMAIL", "me@", "not an email address")
+    );
+}
+
+#[test]
+fn debug_output_of_config_does_not_show_the_password() {
+    let config = config_ok(&[DB, USER, APP_PASSWORD, ALERT]);
     let shown = format!("{config:?}");
-    assert!(!shown.contains("s3cret"), "token leaked into {shown}");
+    assert!(!shown.contains(SECRET), "password leaked into {shown}");
 }
 
 #[test]
-fn debug_output_of_ntfy_shows_the_token_as_stars() {
-    let config = config_ok(&[
-        DB,
-        ("HAGGLE_NTFY_URL", NTFY_URL),
-        ("HAGGLE_NTFY_TOKEN", "s3cret"),
-    ]);
-    let ntfy = config.ntfy.expect("ntfy is configured");
+fn debug_output_of_email_shows_the_password_as_stars() {
+    let email = config_ok(&[DB, USER, APP_PASSWORD, ALERT])
+        .email
+        .expect("email is configured");
+    let shown = format!("{email:?}");
     assert!(
-        format!("{ntfy:?}").contains(r#"token: Some("***")"#),
-        "token should be masked"
+        shown.contains("***"),
+        "password should be masked in {shown}"
     );
+    assert!(!shown.contains(SECRET), "password leaked into {shown}");
 }
 
 #[test]
-fn invalid_ntfy_error_does_not_show_the_token() {
-    let error = config_err(&[
-        DB,
-        ("HAGGLE_NTFY_URL", "ftp://ntfy.example.com/haggle"),
-        ("HAGGLE_NTFY_TOKEN", "s3cret"),
-    ]);
-    assert!(!error.to_string().contains("s3cret"));
+fn invalid_email_error_does_not_show_the_password() {
+    let error = config_err(&[DB, ("GMAIL_USER", "not-an-address"), APP_PASSWORD, ALERT]);
+    assert!(!error.to_string().contains(SECRET));
+    assert!(!format!("{error:?}").contains(SECRET));
+}
+
+#[test]
+fn missing_email_error_does_not_show_the_password() {
+    let error = config_err(&[DB, APP_PASSWORD, ALERT]);
+    assert!(!error.to_string().contains(SECRET));
+    assert!(!format!("{error:?}").contains(SECRET));
 }
 
 #[test]

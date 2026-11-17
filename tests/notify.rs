@@ -1,37 +1,26 @@
-//! Tests for `haggle::notify`: `message_for` on hand-built events, and `Notifier::send` against a
-//! local HTTP server on 127.0.0.1.
+//! Tests for `haggle::notify`: `message_for` on hand-built events, and `Notifier` sending through
+//! a fake SMTP server on 127.0.0.1.
 
+#[path = "support/fake_smtp.rs"]
+mod fake_smtp;
+
+use fake_smtp::{FakeSmtp, ReceivedMessage};
+use haggle::config::{SMTP_HOST, SMTP_PORT};
 use haggle::db::{Event, EventKind, Watch, WatchStatus};
 use haggle::money::{Currency, Money};
 use haggle::notify::{Message, Notifier, NotifyError, message_for};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::task::JoinHandle;
-use url::Url;
+use tokio::net::TcpListener;
 
 /// The product page of the watches used here. Its host is `shop.example`.
 const SHOP_URL: &str = "https://shop.example/p/1";
 
-/// The topic path the notifier is pointed at in the send tests.
-const TOPIC_PATH: &str = "/haggle-test";
+/// The sender and recipient addresses of the send tests.
+const FROM: &str = "haggle@example.com";
+const TO: &str = "me@example.com";
 
-/// A request as the local server read it.
-struct Recorded {
-    method: String,
-    path: String,
-    headers: Vec<(String, String)>,
-    body: String,
-}
-
-impl Recorded {
-    /// The value of the first header called `name`, matched without regard to case.
-    fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.as_str())
-    }
-}
+/// The event line of the sample message the send tests post. It is ASCII, so it can be found
+/// in the raw data as it is.
+const SAMPLE_LINE: &str = "Price drop: 10.00 EUR to 9.00 EUR";
 
 /// A money amount in EUR. Amounts are in minor units, so 1000 is 10.00 EUR.
 fn eur(minor: i64) -> Money {
@@ -75,9 +64,15 @@ fn event(kind: EventKind, old: Option<i64>, new: Option<i64>) -> Event {
     }
 }
 
-/// The lines of a message body.
-fn body_lines(message: &Message) -> Vec<&str> {
-    message.body.lines().collect()
+/// The event lines of a message body: the lines before the blank line that precedes the URL.
+fn event_lines(message: &Message) -> Vec<&str> {
+    message
+        .body
+        .split("\n\n")
+        .next()
+        .unwrap_or("")
+        .lines()
+        .collect()
 }
 
 /// The phrase of each event kind, in the priority order that picks the lead event.
@@ -94,41 +89,47 @@ fn priority_table() -> Vec<(EventKind, &'static str)> {
 }
 
 #[test]
-fn single_price_drop_titles_with_phrase_and_watch_name() {
+fn single_price_drop_subject_is_phrase_and_watch_name() {
     let events = [event(EventKind::PriceDrop, Some(1000), Some(900))];
     let message = message_for(&kettle(), &events);
-    assert_eq!(message.title, "Price drop: Kettle");
+    assert_eq!(message.subject, "Price drop: Kettle");
 }
 
 #[test]
 fn single_price_drop_body_shows_old_and_new_price() {
     let events = [event(EventKind::PriceDrop, Some(1000), Some(900))];
     let message = message_for(&kettle(), &events);
-    assert_eq!(body_lines(&message), ["Price drop: 10.00 EUR → 9.00 EUR"]);
+    assert_eq!(event_lines(&message), ["Price drop: 10.00 EUR → 9.00 EUR"]);
 }
 
 #[test]
-fn click_is_the_watch_url() {
-    let events = [event(EventKind::PriceDrop, Some(1000), Some(900))];
-    let message = message_for(&kettle(), &events);
-    assert_eq!(message.click, SHOP_URL);
-}
-
-#[test]
-fn price_drop_is_not_high_priority() {
-    let events = [event(EventKind::PriceDrop, Some(1000), Some(900))];
-    let message = message_for(&kettle(), &events);
-    assert!(!message.high_priority);
-}
-
-#[test]
-fn lowest_ever_leads_the_title_over_price_drop() {
+fn body_is_event_lines_then_blank_line_then_watch_url() {
     let events = [
         event(EventKind::PriceDrop, Some(1000), Some(900)),
         event(EventKind::LowestEver, None, Some(900)),
     ];
     let message = message_for(&kettle(), &events);
-    assert_eq!(message.title, "Lowest price ever: Kettle");
+    assert_eq!(
+        message.body,
+        "Price drop: 10.00 EUR → 9.00 EUR\nLowest price ever: 9.00 EUR\n\nhttps://shop.example/p/1"
+    );
+}
+
+#[test]
+fn body_ends_with_the_watch_url_as_its_last_line() {
+    let events = [event(EventKind::PriceDrop, Some(1000), Some(900))];
+    let message = message_for(&kettle(), &events);
+    assert_eq!(message.body.lines().last(), Some(SHOP_URL));
+}
+
+#[test]
+fn lowest_ever_leads_the_subject_over_price_drop() {
+    let events = [
+        event(EventKind::PriceDrop, Some(1000), Some(900)),
+        event(EventKind::LowestEver, None, Some(900)),
+    ];
+    let message = message_for(&kettle(), &events);
+    assert_eq!(message.subject, "Lowest price ever: Kettle");
 }
 
 #[test]
@@ -139,7 +140,7 @@ fn body_has_one_line_per_event_in_input_order() {
     ];
     let message = message_for(&kettle(), &events);
     assert_eq!(
-        body_lines(&message),
+        event_lines(&message),
         [
             "Price drop: 10.00 EUR → 9.00 EUR",
             "Lowest price ever: 9.00 EUR",
@@ -155,7 +156,7 @@ fn body_follows_input_order_not_priority_order() {
     ];
     let message = message_for(&kettle(), &events);
     assert_eq!(
-        body_lines(&message),
+        event_lines(&message),
         [
             "Lowest price ever: 9.00 EUR",
             "Price drop: 10.00 EUR → 9.00 EUR",
@@ -164,31 +165,20 @@ fn body_follows_input_order_not_priority_order() {
 }
 
 #[test]
-fn target_hit_is_high_priority_and_leads_the_title() {
+fn target_hit_leads_the_subject() {
     let events = [event(EventKind::TargetHit, None, Some(900))];
     let message = message_for(&kettle(), &events);
-    assert!(message.high_priority);
-    assert_eq!(message.title, "Target price reached: Kettle");
+    assert_eq!(message.subject, "Target price reached: Kettle");
 }
 
 #[test]
-fn target_hit_among_other_events_makes_the_message_high_priority() {
+fn target_hit_among_other_events_still_leads_the_subject() {
     let events = [
         event(EventKind::PriceDrop, Some(1000), Some(900)),
         event(EventKind::TargetHit, None, Some(900)),
     ];
     let message = message_for(&kettle(), &events);
-    assert!(message.high_priority);
-}
-
-#[test]
-fn message_without_target_hit_is_not_high_priority() {
-    let events = [
-        event(EventKind::LowestEver, None, Some(900)),
-        event(EventKind::BackInStock, None, Some(900)),
-    ];
-    let message = message_for(&kettle(), &events);
-    assert!(!message.high_priority);
+    assert_eq!(message.subject, "Target price reached: Kettle");
 }
 
 #[test]
@@ -205,7 +195,11 @@ fn lead_is_the_highest_priority_event_whatever_the_input_order() {
             .map(|(kind, _)| event(kind, None, None))
             .collect();
         let message = message_for(&kettle(), &events);
-        assert_eq!(message.title, format!("{phrase}: Kettle"), "cut at {start}");
+        assert_eq!(
+            message.subject,
+            format!("{phrase}: Kettle"),
+            "cut at {start}"
+        );
     }
 }
 
@@ -214,7 +208,7 @@ fn label_is_the_host_when_the_watch_has_no_name() {
     let shop = watch(SHOP_URL, None);
     let events = [event(EventKind::PriceDrop, Some(1000), Some(900))];
     let message = message_for(&shop, &events);
-    assert_eq!(message.title, "Price drop: shop.example");
+    assert_eq!(message.subject, "Price drop: shop.example");
 }
 
 #[test]
@@ -222,7 +216,7 @@ fn label_is_the_url_when_the_watch_has_no_name_and_the_url_has_no_host() {
     let odd = watch("not a url", None);
     let events = [event(EventKind::PriceDrop, Some(1000), Some(900))];
     let message = message_for(&odd, &events);
-    assert_eq!(message.title, "Price drop: not a url");
+    assert_eq!(message.subject, "Price drop: not a url");
 }
 
 #[test]
@@ -231,7 +225,7 @@ fn inflated_sale_body_names_new_price_and_claimed_old_price() {
     let events = [event(EventKind::InflatedSale, Some(1200), Some(700))];
     let message = message_for(&kettle(), &events);
     assert_eq!(
-        body_lines(&message),
+        event_lines(&message),
         ["Inflated sale: 7.00 EUR, claimed was 12.00 EUR"]
     );
 }
@@ -240,117 +234,53 @@ fn inflated_sale_body_names_new_price_and_claimed_old_price() {
 fn back_in_stock_with_only_new_price_shows_phrase_and_price() {
     let events = [event(EventKind::BackInStock, None, Some(900))];
     let message = message_for(&kettle(), &events);
-    assert_eq!(body_lines(&message), ["Back in stock: 9.00 EUR"]);
+    assert_eq!(event_lines(&message), ["Back in stock: 9.00 EUR"]);
 }
 
 #[test]
-fn back_in_stock_titles_with_phrase_and_watch_name() {
+fn back_in_stock_subject_is_phrase_and_watch_name() {
     let events = [event(EventKind::BackInStock, None, Some(900))];
     let message = message_for(&kettle(), &events);
-    assert_eq!(message.title, "Back in stock: Kettle");
+    assert_eq!(message.subject, "Back in stock: Kettle");
 }
 
 #[test]
 fn price_rise_body_shows_old_and_new_price() {
     let events = [event(EventKind::PriceRise, Some(900), Some(1000))];
     let message = message_for(&kettle(), &events);
-    assert_eq!(body_lines(&message), ["Price rise: 9.00 EUR → 10.00 EUR"]);
+    assert_eq!(event_lines(&message), ["Price rise: 9.00 EUR → 10.00 EUR"]);
 }
 
 #[test]
 fn event_without_prices_has_phrase_only_in_body() {
     let events = [event(EventKind::OutOfStock, None, None)];
     let message = message_for(&kettle(), &events);
-    assert_eq!(body_lines(&message), ["Out of stock"]);
+    assert_eq!(event_lines(&message), ["Out of stock"]);
 }
 
-/// The message a send test posts when it does not care about the content.
+/// The message the send tests post when they do not care about its content. The body is the
+/// sample event line, a blank line and the watch URL.
 fn sample_message() -> Message {
     Message {
-        title: "Price drop: Kettle".to_string(),
-        body: "Price drop: 10.00 EUR → 9.00 EUR".to_string(),
-        click: SHOP_URL.to_string(),
-        high_priority: false,
+        subject: "Price drop: Kettle".to_string(),
+        body: format!("{SAMPLE_LINE}\n\n{SHOP_URL}"),
     }
 }
 
-/// A raw HTTP/1.1 reply with an empty body and the given status line.
-fn reply(status: &str) -> Vec<u8> {
-    format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").into_bytes()
+/// A notifier that sends through `server` as `FROM` to `TO`, with no TLS and no login.
+fn notifier_for(server: &FakeSmtp) -> Notifier {
+    Notifier::unencrypted("127.0.0.1", server.port(), FROM, TO).expect("notifier should build")
 }
 
-/// Reads more bytes of a request into `raw`. A connection that closes mid-request fails the test.
-async fn read_more(socket: &mut TcpStream, raw: &mut Vec<u8>) {
-    let mut chunk = [0u8; 512];
-    let read = socket.read(&mut chunk).await.expect("read request");
-    assert!(read > 0, "client closed the connection mid-request");
-    raw.extend_from_slice(&chunk[..read]);
-}
-
-/// Reads one request: the head up to the blank line, then the body its Content-Length gives.
-async fn read_request(socket: &mut TcpStream) -> Recorded {
-    let mut raw = Vec::new();
-    let head_end = loop {
-        if let Some(at) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
-            break at + 4;
-        }
-        read_more(socket, &mut raw).await;
-    };
-    let head = String::from_utf8(raw[..head_end].to_vec()).expect("request head is UTF-8");
-    let mut lines = head.split("\r\n");
-    let mut request_line = lines.next().expect("request line").split_whitespace();
-    let method = request_line.next().expect("method").to_string();
-    let path = request_line.next().expect("request target").to_string();
-    let headers: Vec<(String, String)> = lines
-        .filter(|line| !line.is_empty())
-        .map(|line| {
-            let (name, value) = line.split_once(':').expect("header line has a colon");
-            (name.trim().to_string(), value.trim().to_string())
-        })
-        .collect();
-    let length: usize = headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-        .map_or(0, |(_, value)| {
-            value.parse().expect("numeric Content-Length")
-        });
-    while raw.len() < head_end + length {
-        read_more(socket, &mut raw).await;
-    }
-    let body = String::from_utf8(raw[head_end..head_end + length].to_vec())
-        .expect("request body is UTF-8");
-    Recorded {
-        method,
-        path,
-        headers,
-        body,
-    }
-}
-
-/// Serves one connection on 127.0.0.1 with `reply`. The URL is the topic path on that server.
-/// The handle yields what the client sent.
-async fn serve_once(reply: Vec<u8>) -> (Url, JoinHandle<Recorded>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
+/// Sends the sample message through `server` and returns the one message it received.
+async fn sent_to(server: &FakeSmtp) -> ReceivedMessage {
+    notifier_for(server)
+        .send(&sample_message())
         .await
-        .expect("bind a local port");
-    let address = listener.local_addr().expect("local address");
-    let url = Url::parse(&format!("http://{address}{TOPIC_PATH}")).expect("valid url");
-    let request = tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.expect("accept connection");
-        let request = read_request(&mut socket).await;
-        socket.write_all(&reply).await.expect("write reply");
-        socket.shutdown().await.expect("shut down connection");
-        request
-    });
-    (url, request)
-}
-
-/// Sends `message` with `token` to a local server that answers 200, and returns what it got.
-async fn sent(token: Option<&str>, message: &Message) -> Recorded {
-    let (url, request) = serve_once(reply("200 OK")).await;
-    let notifier = Notifier::new(url, token.map(str::to_string)).expect("notifier should build");
-    notifier.send(message).await.expect("send should succeed");
-    request.await.expect("server task should finish")
+        .expect("send should succeed");
+    let mut messages = server.messages();
+    assert_eq!(messages.len(), 1, "expected exactly one message");
+    messages.remove(0)
 }
 
 /// The error of a send that must fail. Panics if the send succeeded.
@@ -361,109 +291,168 @@ fn send_error(result: Result<(), NotifyError>) -> NotifyError {
     }
 }
 
-#[tokio::test]
-async fn send_posts_to_the_topic_path() {
-    let request = sent(None, &sample_message()).await;
-    assert_eq!(request.method, "POST");
-    assert_eq!(request.path, TOPIC_PATH);
+/// The error of a notifier that must not build. Panics if it did.
+fn build_error(result: Result<Notifier, NotifyError>) -> NotifyError {
+    match result {
+        Ok(_) => panic!("expected the notifier not to build"),
+        Err(error) => error,
+    }
 }
 
 #[tokio::test]
-async fn send_body_is_the_message_body_as_utf8_text() {
-    let request = sent(None, &sample_message()).await;
-    assert_eq!(request.body, "Price drop: 10.00 EUR → 9.00 EUR");
+async fn send_delivers_exactly_one_message() {
+    let server = FakeSmtp::start().await;
+    sent_to(&server).await;
+    assert_eq!(server.count(), 1);
 }
 
 #[tokio::test]
-async fn send_declares_the_body_as_plain_text() {
-    let request = sent(None, &sample_message()).await;
-    let content_type = request.header("Content-Type").expect("Content-Type header");
+async fn send_envelope_sender_is_the_from_address() {
+    let server = FakeSmtp::start().await;
+    let received = sent_to(&server).await;
+    assert_eq!(received.from, FROM);
+}
+
+#[tokio::test]
+async fn send_envelope_recipient_is_the_to_address() {
+    let server = FakeSmtp::start().await;
+    let received = sent_to(&server).await;
+    assert_eq!(received.recipients, [TO]);
+}
+
+#[tokio::test]
+async fn send_data_has_a_subject_header_with_the_subject() {
+    let server = FakeSmtp::start().await;
+    let received = sent_to(&server).await;
     assert!(
-        content_type.starts_with("text/plain"),
-        "Content-Type was {content_type:?}"
+        received
+            .data
+            .lines()
+            .any(|line| line == "Subject: Price drop: Kettle"),
+        "no Subject header in {:?}",
+        received.data
     );
 }
 
 #[tokio::test]
-async fn send_sends_ascii_title_as_is_in_title_header() {
-    let request = sent(None, &sample_message()).await;
-    assert_eq!(request.header("Title"), Some("Price drop: Kettle"));
+async fn send_data_contains_the_event_line() {
+    let server = FakeSmtp::start().await;
+    let received = sent_to(&server).await;
+    assert!(
+        received.data.contains(SAMPLE_LINE),
+        "event line missing from {:?}",
+        received.data
+    );
 }
 
 #[tokio::test]
-async fn send_sends_click_header_as_the_watch_url() {
-    let request = sent(None, &sample_message()).await;
-    assert_eq!(request.header("Click"), Some(SHOP_URL));
+async fn send_data_contains_the_watch_url() {
+    let server = FakeSmtp::start().await;
+    let received = sent_to(&server).await;
+    assert!(
+        received.data.contains(SHOP_URL),
+        "watch URL missing from {:?}",
+        received.data
+    );
 }
 
 #[tokio::test]
-async fn send_sends_bearer_authorization_when_a_token_is_set() {
-    let request = sent(Some("tok"), &sample_message()).await;
-    assert_eq!(request.header("Authorization"), Some("Bearer tok"));
+async fn send_data_is_declared_as_plain_text() {
+    let server = FakeSmtp::start().await;
+    let received = sent_to(&server).await;
+    assert!(
+        received
+            .data
+            .lines()
+            .any(|line| line.starts_with("Content-Type: text/plain")),
+        "no text/plain Content-Type in {:?}",
+        received.data
+    );
 }
 
 #[tokio::test]
-async fn send_sends_no_authorization_header_without_a_token() {
-    let request = sent(None, &sample_message()).await;
-    assert_eq!(request.header("Authorization"), None);
+async fn send_fails_with_transport_error_when_the_server_refuses_the_data() {
+    let server = FakeSmtp::start().await;
+    server.answer_data_with(451);
+    let error = send_error(notifier_for(&server).send(&sample_message()).await);
+    assert!(
+        matches!(error, NotifyError::Transport(_)),
+        "expected a transport error, got: {error}"
+    );
 }
 
 #[tokio::test]
-async fn send_sets_priority_4_for_high_priority_message() {
-    let message = Message {
-        high_priority: true,
-        ..sample_message()
-    };
-    let request = sent(None, &message).await;
-    assert_eq!(request.header("Priority"), Some("4"));
-}
-
-#[tokio::test]
-async fn send_sends_no_priority_header_for_normal_message() {
-    let request = sent(None, &sample_message()).await;
-    assert_eq!(request.header("Priority"), None);
-}
-
-#[tokio::test]
-async fn send_encodes_non_ascii_title_as_rfc_2047_base64() {
-    // "Café" is the bytes 43 61 66 C3 A9 in UTF-8, which base64 writes as "Q2Fmw6k=".
-    let message = Message {
-        title: "Café".to_string(),
-        ..sample_message()
-    };
-    let request = sent(None, &message).await;
-    assert_eq!(request.header("Title"), Some("=?UTF-8?B?Q2Fmw6k=?="));
-}
-
-#[tokio::test]
-async fn send_returns_status_error_with_the_code_of_a_500_reply() {
-    let (url, _request) = serve_once(reply("500 Internal Server Error")).await;
-    let notifier = Notifier::new(url, None).expect("notifier should build");
-    let error = send_error(notifier.send(&sample_message()).await);
-    assert_eq!(error, NotifyError::Status(500));
-}
-
-#[tokio::test]
-async fn send_returns_status_error_with_the_code_of_a_403_reply() {
-    let (url, _request) = serve_once(reply("403 Forbidden")).await;
-    let notifier = Notifier::new(url, None).expect("notifier should build");
-    let error = send_error(notifier.send(&sample_message()).await);
-    assert_eq!(error, NotifyError::Status(403));
-}
-
-#[tokio::test]
-async fn send_returns_network_error_when_nothing_listens_on_the_port() {
+async fn send_to_a_port_with_nothing_listening_is_a_transport_error() {
     // Bind a port, then release it, so nothing is listening when the send connects.
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind a local port");
-    let address = listener.local_addr().expect("local address");
+    let port = listener.local_addr().expect("local address").port();
     drop(listener);
-    let url = Url::parse(&format!("http://{address}{TOPIC_PATH}")).expect("valid url");
-    let notifier = Notifier::new(url, None).expect("notifier should build");
+    let notifier =
+        Notifier::unencrypted("127.0.0.1", port, FROM, TO).expect("notifier should build");
     let error = send_error(notifier.send(&sample_message()).await);
     assert!(
-        matches!(error, NotifyError::Network(_)),
-        "expected a network error, got {error:?}"
+        matches!(error, NotifyError::Transport(_)),
+        "expected a transport error, got: {error}"
+    );
+}
+
+#[test]
+fn unencrypted_rejects_a_from_address_that_is_not_an_address() {
+    let error = build_error(Notifier::unencrypted(
+        "127.0.0.1",
+        SMTP_PORT,
+        "not an address",
+        TO,
+    ));
+    assert!(
+        matches!(error, NotifyError::Address(_)),
+        "expected an address error, got: {error}"
+    );
+}
+
+#[test]
+fn unencrypted_rejects_a_to_address_that_is_not_an_address() {
+    let error = build_error(Notifier::unencrypted(
+        "127.0.0.1",
+        SMTP_PORT,
+        FROM,
+        "nobody",
+    ));
+    assert!(
+        matches!(error, NotifyError::Address(_)),
+        "expected an address error, got: {error}"
+    );
+}
+
+#[test]
+fn gmail_builds_for_valid_addresses() {
+    assert!(Notifier::gmail(SMTP_HOST, SMTP_PORT, FROM, "app-pass", TO).is_ok());
+}
+
+#[test]
+fn gmail_rejects_a_user_address_that_is_not_an_address() {
+    let error = build_error(Notifier::gmail(
+        SMTP_HOST, SMTP_PORT, "a b@c", "app-pass", TO,
+    ));
+    assert!(
+        matches!(error, NotifyError::Address(_)),
+        "expected an address error, got: {error}"
+    );
+}
+
+#[test]
+fn gmail_rejects_a_to_address_that_is_not_an_address() {
+    let error = build_error(Notifier::gmail(
+        SMTP_HOST,
+        SMTP_PORT,
+        FROM,
+        "app-pass",
+        "not-an-address",
+    ));
+    assert!(
+        matches!(error, NotifyError::Address(_)),
+        "expected an address error, got: {error}"
     );
 }
