@@ -1,0 +1,36 @@
+# systemd unit for Haggle, the price watcher. Runs `haggle serve` on hp-server.
+# `make install` copies this file to /etc/systemd/system/.
+# The service reads its settings from /etc/haggle/haggle.env, which holds
+# HAGGLE_DB, HAGGLE_LISTEN, HAGGLE_NTFY_URL and the secret HAGGLE_NTFY_TOKEN.
+# Keep that file owned by root with mode 600; systemd reads it before switching to the haggle user.
+
+[Unit]
+Description=Haggle price watcher
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/mnt/database/haggle
+
+[Service]
+Type=simple
+User=haggle
+Group=haggle
+EnvironmentFile=/etc/haggle/haggle.env
+ExecStart=/usr/local/bin/haggle serve
+Restart=on-failure
+RestartSec=10s
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# The database, its WAL files and backups all live here; the only writable path.
+ReadWritePaths=/mnt/database/haggle
+
+[Install]
+WantedBy=multi-user.target
