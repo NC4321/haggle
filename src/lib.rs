@@ -9,3 +9,4 @@ pub mod money;
 pub mod notify;
 pub mod rules;
 pub mod scheduler;
+pub mod web;
