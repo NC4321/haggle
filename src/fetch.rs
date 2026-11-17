@@ -1,6 +1,9 @@
-//! HTTP fetching of product pages with conditional GET.
+//! HTTP fetching of product pages with conditional GET, robots.txt rules and polite per-host pacing.
 
-use std::time::Duration;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
+use tokio::sync::Mutex;
 
 /// The User-Agent header sent with every request.
 pub const USER_AGENT: &str = concat!(
@@ -56,10 +59,59 @@ const MAX_REDIRECTS: usize = 5;
 /// The Accept header sent with every request.
 const ACCEPT_HEADER: &str = "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8";
 
+/// Largest part of a robots.txt body that is read; the rest is ignored.
+const MAX_ROBOTS_BYTES: usize = 500 * 1024;
+
+/// Path of the robots.txt file at the root of an origin.
+const ROBOTS_PATH: &str = "/robots.txt";
+
+/// Per-host politeness settings.
+#[derive(Debug, Clone, Copy)]
+pub struct Politeness {
+    /// Minimum time between two requests to the same host.
+    pub host_interval: Duration,
+    /// How long a fetched robots.txt is reused.
+    pub robots_ttl: Duration,
+    /// Minimum time a host is left alone after answering 429.
+    pub rate_limit_pause: Duration,
+}
+
+impl Default for Politeness {
+    fn default() -> Politeness {
+        Politeness {
+            host_interval: Duration::from_secs(5),
+            robots_ttl: Duration::from_secs(24 * 3600),
+            rate_limit_pause: Duration::from_secs(3600),
+        }
+    }
+}
+
+/// What is known about one host: when it was last asked and whether it asked us to stop.
+#[derive(Default)]
+struct HostState {
+    last_request: Option<Instant>,
+    paused_until: Option<Instant>,
+}
+
+/// A fetched robots.txt; an empty body allows everything.
+struct CachedRobots {
+    body: String,
+    fetched_at: Instant,
+}
+
+/// Politeness state shared by all requests of a fetcher, keyed by host or origin.
+#[derive(Default)]
+struct PoliteState {
+    hosts: HashMap<String, HostState>,
+    robots: HashMap<String, CachedRobots>,
+}
+
 /// An HTTP client with the haggle User-Agent, timeout and size limit.
 pub struct Fetcher {
     client: reqwest::Client,
     max_bytes: usize,
+    politeness: Politeness,
+    state: Mutex<PoliteState>,
 }
 
 impl Fetcher {
@@ -75,7 +127,124 @@ impl Fetcher {
             .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS))
             .build()
             .map_err(network_error)?;
-        Ok(Fetcher { client, max_bytes })
+        Ok(Fetcher {
+            client,
+            max_bytes,
+            politeness: Politeness::default(),
+            state: Mutex::new(PoliteState::default()),
+        })
+    }
+
+    /// Replaces the politeness settings (`Fetcher::new` uses `Politeness::default()`).
+    pub fn with_politeness(mut self, politeness: Politeness) -> Fetcher {
+        self.politeness = politeness;
+        self
+    }
+
+    /// When requests to `url`'s host may start again after a 429, if they are paused.
+    ///
+    /// Returns `None` when the host is not paused, the pause is over, or `url` has no host.
+    pub async fn paused_until(&self, url: &url::Url) -> Option<Instant> {
+        let host_key = host_key(url).ok()?;
+        let state = self.state.lock().await;
+        state
+            .hosts
+            .get(&host_key)?
+            .paused_until
+            .filter(|&until| until > Instant::now())
+    }
+
+    /// Waits until `host_interval` has passed since the previous request to `host_key`.
+    ///
+    /// The request slot is reserved before sleeping, so concurrent callers queue up one interval apart.
+    async fn wait_for_turn(&self, host_key: &str) {
+        let start = {
+            let mut state = self.state.lock().await;
+            let host = state.hosts.entry(host_key.to_owned()).or_default();
+            let now = Instant::now();
+            let start = host
+                .last_request
+                .map_or(now, |last| (last + self.politeness.host_interval).max(now));
+            host.last_request = Some(start);
+            start
+        };
+        tokio::time::sleep(start.saturating_duration_since(Instant::now())).await;
+    }
+
+    /// Pauses requests to `host_key` for the configured pause or `retry_after`, whichever is longer.
+    async fn pause_host(&self, host_key: &str, retry_after: Option<Duration>) {
+        let pause = retry_after
+            .unwrap_or_default()
+            .max(self.politeness.rate_limit_pause);
+        let mut state = self.state.lock().await;
+        state
+            .hosts
+            .entry(host_key.to_owned())
+            .or_default()
+            .paused_until = Some(Instant::now() + pause);
+    }
+
+    /// Whether robots.txt of `url`'s origin allows fetching `url`.
+    ///
+    /// Uses the cached robots.txt while it is younger than `robots_ttl`, else fetches it.
+    async fn robots_allow(&self, url: &url::Url, host_key: &str) -> Result<bool, FetchError> {
+        let origin = format!("{}://{host_key}", url.scheme());
+        let cached = {
+            let state = self.state.lock().await;
+            state
+                .robots
+                .get(&origin)
+                .filter(|robots| robots.fetched_at.elapsed() < self.politeness.robots_ttl)
+                .map(|robots| robots.body.clone())
+        };
+        let body = match cached {
+            Some(body) => body,
+            None => self.refresh_robots(&origin, host_key).await?,
+        };
+        let path_and_query = &url[url::Position::BeforePath..url::Position::AfterQuery];
+        Ok(robots_allows(&body, ROBOTS_AGENT, path_and_query))
+    }
+
+    /// Fetches and caches the robots.txt of `origin`, returning its body.
+    ///
+    /// A 4xx answer gives an empty body (allow all). A 5xx answer gives `FetchError::Blocked`
+    /// and is not cached. Returns `FetchError::Network` when the request fails.
+    async fn refresh_robots(&self, origin: &str, host_key: &str) -> Result<String, FetchError> {
+        self.wait_for_turn(host_key).await;
+        let response = self
+            .client
+            .get(format!("{origin}{ROBOTS_PATH}"))
+            .send()
+            .await
+            .map_err(network_error)?;
+        let status = response.status();
+        if status.is_server_error() {
+            return Err(FetchError::Blocked);
+        }
+        let body = if status.is_success() {
+            let bytes = read_body_prefix(response, MAX_ROBOTS_BYTES).await?;
+            String::from_utf8_lossy(&bytes).into_owned()
+        } else {
+            String::new()
+        };
+        self.state.lock().await.robots.insert(
+            origin.to_owned(),
+            CachedRobots {
+                body: body.clone(),
+                fetched_at: Instant::now(),
+            },
+        );
+        Ok(body)
+    }
+}
+
+/// The key identifying `url`'s host: host name and port.
+///
+/// Returns `FetchError::Network` when `url` has no host or port.
+fn host_key(url: &url::Url) -> Result<String, FetchError> {
+    match (url.host_str(), url.port_or_known_default()) {
+        (Some(host), Some(port)) => Ok(format!("{host}:{port}")),
+        _ => Err(FetchError::Network(format!("URL has no host: {url}"))),
     }
 }
 
@@ -115,6 +284,46 @@ async fn read_body(
     Ok(body)
 }
 
+/// Reads at most `limit` bytes of the body and ignores the rest.
+async fn read_body_prefix(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, FetchError> {
+    let mut body = Vec::new();
+    while body.len() < limit {
+        let Some(chunk) = response.chunk().await.map_err(network_error)? else {
+            break;
+        };
+        let room = limit - body.len();
+        body.extend_from_slice(&chunk[..chunk.len().min(room)]);
+    }
+    Ok(body)
+}
+
+/// A failed page request, with the delay the site asked for when it answered 429.
+struct PageFailure {
+    error: FetchError,
+    retry_after: Option<Duration>,
+}
+
+impl From<FetchError> for PageFailure {
+    fn from(error: FetchError) -> PageFailure {
+        PageFailure {
+            error,
+            retry_after: None,
+        }
+    }
+}
+
+/// The Retry-After delay of `response` when given in seconds; the HTTP-date form is ignored.
+fn retry_after_delay(response: &reqwest::Response) -> Option<Duration> {
+    header_text(response, reqwest::header::RETRY_AFTER)?
+        .trim()
+        .parse()
+        .ok()
+        .map(Duration::from_secs)
+}
+
 /// Fetches `url`, sending `previous` validators so an unchanged page gives `Fetched::NotModified`.
 ///
 /// Returns `FetchError` when the site blocks or rate limits the request,
@@ -125,6 +334,48 @@ pub async fn fetch(
     url: &url::Url,
     previous: Option<&Validators>,
 ) -> Result<Fetched, FetchError> {
+    request_page(client, url, previous)
+        .await
+        .map_err(|failure| failure.error)
+}
+
+/// Fetches `url` politely: robots.txt, host spacing and 429 pauses, then `fetch`.
+///
+/// Returns `FetchError::RateLimited` without any request while the host is paused after a 429
+/// (a new 429 pauses it for the longer of `rate_limit_pause` and Retry-After),
+/// `FetchError::Blocked` when robots.txt disallows `url` or cannot be had (5xx),
+/// `FetchError::Network` when robots.txt cannot be requested, and otherwise the errors of `fetch`.
+pub async fn fetch_page(
+    client: &Fetcher,
+    url: &url::Url,
+    previous: Option<&Validators>,
+) -> Result<Fetched, FetchError> {
+    let host_key = host_key(url)?;
+    if client.paused_until(url).await.is_some() {
+        return Err(FetchError::RateLimited);
+    }
+    if !client.robots_allow(url, &host_key).await? {
+        return Err(FetchError::Blocked);
+    }
+    client.wait_for_turn(&host_key).await;
+    match request_page(client, url, previous).await {
+        Err(PageFailure {
+            error: FetchError::RateLimited,
+            retry_after,
+        }) => {
+            client.pause_host(&host_key, retry_after).await;
+            Err(FetchError::RateLimited)
+        }
+        result => result.map_err(|failure| failure.error),
+    }
+}
+
+/// The request path shared by `fetch` and `fetch_page`, keeping the Retry-After delay of a 429.
+async fn request_page(
+    client: &Fetcher,
+    url: &url::Url,
+    previous: Option<&Validators>,
+) -> Result<Fetched, PageFailure> {
     use reqwest::header::{ACCEPT, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
 
     let mut request = client.client.get(url.clone()).header(ACCEPT, ACCEPT_HEADER);
@@ -140,12 +391,18 @@ pub async fn fetch(
     if response.status() == reqwest::StatusCode::NOT_MODIFIED {
         return Ok(Fetched::NotModified);
     }
+    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(PageFailure {
+            error: FetchError::RateLimited,
+            retry_after: retry_after_delay(&response),
+        });
+    }
     check_status(response.status())?;
     let too_large = response
         .content_length()
         .is_some_and(|length| length > client.max_bytes as u64);
     if too_large {
-        return Err(FetchError::TooLarge);
+        return Err(FetchError::TooLarge.into());
     }
     let validators = Validators {
         etag: header_text(&response, ETAG),
