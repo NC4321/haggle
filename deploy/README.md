@@ -36,7 +36,7 @@ sudo mkdir -p /mnt/database/haggle/backups
 sudo chown -R haggle:haggle /mnt/database/haggle
 ```
 
-Create the settings file that the service reads. It holds a secret, so it is owned by root and readable only by root. Systemd reads it as root when it starts the service.
+Create the settings file that the service reads. It is owned by root and readable only by root. Systemd reads it as root when it starts the service.
 
 ```
 sudo mkdir -p /etc/haggle
@@ -44,16 +44,16 @@ sudo install -m 600 -o root -g root /dev/null /etc/haggle/haggle.env
 sudoedit /etc/haggle/haggle.env
 ```
 
-Put these four lines in the file, replacing the two `HAGGLE_NTFY` values with your ntfy topic URL and access token:
+Put these two lines in the file:
 
 ```
 HAGGLE_DB=/mnt/database/haggle/haggle.db
 HAGGLE_LISTEN=192.168.5.21:8421
-HAGGLE_NTFY_URL=https://YOUR_NTFY_SERVER/YOUR_TOPIC
-HAGGLE_NTFY_TOKEN=YOUR_NTFY_TOKEN
 ```
 
-The token exists only in this file. Do not copy it into the repository, the README or shell history.
+The email settings are shared with isp-speed-monitor. The service also reads `/opt/speedtest/.env`, which must define `GMAIL_USER`, `GMAIL_APP_PASSWORD` and `ALERT_EMAIL`: all three or none. With none of them set, notifications are off and the journal shows a warning. The app password exists only in that file. Do not copy it into the repository, the README or shell history.
+
+To see that notifications work, check that `journalctl -u haggle` shows no "notifications are off" warning. A price drop then arrives in the `ALERT_EMAIL` inbox, sent from `GMAIL_USER`.
 
 ## 3. Install
 
@@ -102,6 +102,8 @@ sudo systemctl restart haggle
 ```
 
 `make install` reloads systemd, so changed units take effect; the service needs the restart to run the new binary.
+
+When upgrading an existing install, remove the old notification lines (the two `HAGGLE_` variables other than `HAGGLE_DB` and `HAGGLE_LISTEN`) from `/etc/haggle/haggle.env`, then run `sudo systemctl daemon-reload && sudo systemctl restart haggle`.
 
 ## 6. Backups
 

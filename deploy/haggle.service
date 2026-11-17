@@ -1,8 +1,9 @@
 # systemd unit for Haggle, the price watcher. Runs `haggle serve` on hp-server.
 # `make install` copies this file to /etc/systemd/system/.
 # The service reads its settings from /etc/haggle/haggle.env, which holds
-# HAGGLE_DB, HAGGLE_LISTEN, HAGGLE_NTFY_URL and the secret HAGGLE_NTFY_TOKEN.
-# Keep that file owned by root with mode 600; systemd reads it before switching to the haggle user.
+# HAGGLE_DB and HAGGLE_LISTEN. The email settings and the secret app password
+# come from /opt/speedtest/.env, owned by isp-speed-monitor.
+# Keep haggle.env owned by root with mode 600; systemd reads both files as root before switching to the haggle user.
 
 [Unit]
 Description=Haggle price watcher
@@ -15,6 +16,7 @@ Type=simple
 User=haggle
 Group=haggle
 EnvironmentFile=/etc/haggle/haggle.env
+EnvironmentFile=/opt/speedtest/.env
 ExecStart=/usr/local/bin/haggle serve
 Restart=on-failure
 RestartSec=10s
