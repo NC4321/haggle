@@ -213,17 +213,18 @@ Note: Added an `events.currency` column (old and new share it). `fetch::fetch_pa
 
 Goal: the web UI shows every watch with its chart, and anyone can see it work in a minute.
 Depends on: M2
-- [ ] Router, shared layout and stylesheet, in `src/web/mod.rs`, `templates/`, `static/` (#28)
-- [ ] Dashboard: watches with latest price, change, status and a sparkline, in `src/web/pages.rs` (#29)
-- [ ] Watch detail: full chart, event list, edit target and interval, pause, delete, in `src/web/pages.rs` (#30)
-- [ ] Add-watch form with a live preview of what was extracted, in `src/web/pages.rs` (#31)
-- [ ] SVG price chart with target line and stock gaps, in `src/web/chart.rs` (#32)
-- [ ] Fake shop with a scripted price and stock timeline, in `src/demo_shop.rs` (#33)
-- [ ] `demo` subcommand: fake shop, temp database, sped-up clock, in `src/cli.rs` (#34)
-- [ ] Test: chart output for a known series, in `src/web/chart.rs` (#35)
-- [ ] Test: each page renders for an empty database and for a populated one, in `tests/web.rs` (#36)
+- [x] Router, shared layout and stylesheet, in `src/web/mod.rs`, `templates/`, `static/` (#28)
+- [x] Dashboard: watches with latest price, change, status and a sparkline, in `src/web/pages.rs` (#29)
+- [x] Watch detail: full chart, event list, edit target and interval, pause, delete, in `src/web/pages.rs` (#30)
+- [x] Add-watch form with a live preview of what was extracted, in `src/web/pages.rs` (#31)
+- [x] SVG price chart with target line and stock gaps, in `src/web/chart.rs` (#32)
+- [x] Fake shop with a scripted price and stock timeline, in `src/demo_shop.rs` (#33)
+- [x] `demo` subcommand: fake shop, temp database, sped-up clock, in `src/cli.rs` (#34)
+- [x] Test: chart output for a known series, in `src/web/chart.rs` (#35)
+- [x] Test: each page renders for an empty database and for a populated one, in `tests/web.rs` (#36)
 
 Done when: `make demo` opens a dashboard where a price drop and a restock appear within one minute.
+Note: Pages split into pages.rs, watch_page.rs and add_page.rs, and page tests into one file per page. Plain HTML forms, with htmx deferred. Clearing a target also clears its currency.
 
 ### M4 · Running on hp-server
 
