@@ -1,10 +1,11 @@
-//! The command-line interface: argument definitions and the `check` command.
+//! The command-line interface: argument definitions and the command implementations.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 use time::OffsetDateTime;
 use time::macros::format_description;
+use tokio::signal::unix::{Signal, SignalKind, signal};
 
 use crate::config::{Config, ConfigError};
 use crate::db::watches;
@@ -12,6 +13,8 @@ use crate::db::{self, DbError, NewWatch, observations};
 use crate::extract::{self, ExtractError};
 use crate::fetch::{DEFAULT_MAX_BYTES, DEFAULT_TIMEOUT, FetchError, Fetched, Fetcher, fetch};
 use crate::money::{self, MoneyError};
+use crate::notify::{Notifier, NotifyError};
+use crate::scheduler;
 
 /// Command-line arguments of the haggle binary.
 #[derive(Debug, Parser)]
@@ -65,6 +68,8 @@ pub enum Command {
         /// The watch id.
         id: i64,
     },
+    /// Run the scheduler until interrupted (Ctrl-C or SIGTERM).
+    Serve,
 }
 
 /// The check interval used when `--every` is not given.
@@ -98,6 +103,10 @@ pub enum CliError {
     InvalidInterval(String),
     #[error("no watch with id {0}")]
     NoSuchWatch(i64),
+    #[error(transparent)]
+    Notify(#[from] NotifyError),
+    #[error("cannot listen for shutdown signals: {0}")]
+    Io(String),
 }
 
 /// Runs the command in `cli`.
@@ -117,6 +126,7 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
         Command::Ls => list(),
         Command::History { id } => history(id),
         Command::Rm { id } => remove(id),
+        Command::Serve => serve().await,
     }
 }
 
@@ -271,4 +281,39 @@ fn remove(id: i64) -> Result<(), CliError> {
     }
     println!("removed watch {id}");
     Ok(())
+}
+
+/// Runs the scheduler until Ctrl-C or SIGTERM.
+async fn serve() -> Result<(), CliError> {
+    // Registered before any other work so an early signal is not lost to the default handler.
+    let mut interrupt = register_signal(SignalKind::interrupt())?;
+    let mut terminate = register_signal(SignalKind::terminate())?;
+    let config = Config::from_env()?;
+    let connection = db::open(&config.db_path)?;
+    let fetcher = Fetcher::new(DEFAULT_TIMEOUT, DEFAULT_MAX_BYTES)?;
+    let notifier = match &config.ntfy {
+        Some(ntfy) => Some(Notifier::new(ntfy.url.clone(), ntfy.token.clone())?),
+        None => {
+            tracing::warn!("notifications are off: HAGGLE_NTFY_URL is not set");
+            None
+        }
+    };
+    let shutdown = async {
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+        }
+    };
+    tracing::info!(
+        db_path = %config.db_path.display(),
+        ntfy = notifier.is_some(),
+        "serving"
+    );
+    scheduler::run(&connection, &fetcher, notifier.as_ref(), shutdown).await?;
+    tracing::info!("shutting down");
+    Ok(())
+}
+
+fn register_signal(kind: SignalKind) -> Result<Signal, CliError> {
+    signal(kind).map_err(|error| CliError::Io(error.to_string()))
 }
