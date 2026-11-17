@@ -13,11 +13,12 @@ const POLL: Duration = Duration::from_millis(20);
 
 /// Variables that change how the binary reads its configuration. Every test clears them and
 /// then sets the ones it needs, so the outcome does not depend on the shell running the tests.
-const HAGGLE_VARS: [&str; 4] = [
+const CONFIG_VARS: [&str; 5] = [
     "HAGGLE_DB",
     "HAGGLE_LISTEN",
-    "HAGGLE_NTFY_URL",
-    "HAGGLE_NTFY_TOKEN",
+    "GMAIL_USER",
+    "GMAIL_APP_PASSWORD",
+    "ALERT_EMAIL",
 ];
 
 /// A database path in the system temp directory, unique to one test. The file and SQLite's
@@ -132,7 +133,7 @@ fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
 fn command(args: &[&str], vars: &[(&str, &str)]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_haggle"));
     command.args(args);
-    for name in HAGGLE_VARS {
+    for name in CONFIG_VARS {
         command.env_remove(name);
     }
     command.envs(vars.iter().copied());

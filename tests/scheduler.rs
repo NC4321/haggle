@@ -1,11 +1,14 @@
 //! Tests for `haggle::scheduler`: `jittered` on its own, and `tick` and `run` end to end against a
-//! local shop and a local ntfy server on 127.0.0.1. No test touches the internet or the live database.
+//! local shop and a fake SMTP server on 127.0.0.1. No test touches the internet or the live database.
+
+#[path = "support/fake_smtp.rs"]
+mod fake_smtp;
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use fake_smtp::FakeSmtp;
 use haggle::config::ensure_scratch_path;
 use haggle::db::{EventKind, NewWatch, StoredEvent, events, open, watches};
 use haggle::fetch::{Fetcher, Politeness};
@@ -26,6 +29,15 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 const PRICE: &str = "10.00";
 /// Price that is a new low, so a drop from `PRICE` makes a PriceDrop and a LowestEver.
 const DROPPED: &str = "9.00";
+/// The sender of every email in these tests.
+const SENDER: &str = "haggle@example.com";
+/// The recipient of every email in these tests.
+const RECIPIENT: &str = "kettle-alerts@example.com";
+/// The reply code for a temporary failure: the server refuses the message now, and the sender may
+/// try again later.
+const TEMPORARY_FAILURE: u16 = 451;
+/// The reply code that accepts a message at the end of DATA.
+const ACCEPTED: u16 = 250;
 
 /// A time at which every watch is due again: two intervals after `now`, which is past the
 /// largest jitter (+10 %), so a watch checked at `now` is due by then.
@@ -118,45 +130,26 @@ fn set_price(shop: &Shop, price: &str) {
     *shop.price.lock().unwrap() = price.to_owned();
 }
 
-/// A local ntfy server that counts the POSTs it receives and answers each with its status.
-struct Ntfy {
-    url: Url,
-    posts: Arc<AtomicUsize>,
-    status: Arc<Mutex<&'static str>>,
-}
-
-impl Ntfy {
-    /// How many POSTs the server has received.
-    fn posts(&self) -> usize {
-        self.posts.load(Ordering::SeqCst)
-    }
-
-    /// Makes the server answer later POSTs with `status`.
-    fn answer_with(&self, status: &'static str) {
-        *self.status.lock().unwrap() = status;
-    }
-}
-
 /// Everything one test needs: a scratch database holding one watch on the shop's `/p/1`, the shop,
-/// the ntfy server, and the clients a tick uses.
+/// the fake SMTP server, and the clients a tick uses.
 struct Fixture {
     conn: Connection,
     scratch: Scratch,
     shop: Shop,
-    ntfy: Ntfy,
+    smtp: FakeSmtp,
     fetcher: Fetcher,
     notifier: Notifier,
     watch_id: i64,
 }
 
 impl Fixture {
-    /// Runs one tick at `now`, notifying through the ntfy server.
+    /// Runs one tick at `now`, notifying through the fake SMTP server.
     async fn tick_at(&self, now: i64) -> TickReport {
         tick_with(&self.conn, &self.fetcher, Some(&self.notifier), now).await
     }
 }
 
-/// Starts a shop showing `price` with `behaviour`, an ntfy server, and a scratch database. The
+/// Starts a shop showing `price` with `behaviour`, a fake SMTP server, and a scratch database. The
 /// database holds one watch on `/p/1`, due at `T0` and checked every `INTERVAL_S`.
 async fn setup(test: &str, price: &str, behaviour: Behaviour) -> Fixture {
     let scratch = Scratch::new(test);
@@ -167,20 +160,21 @@ async fn setup(test: &str, price: &str, behaviour: Behaviour) -> Fixture {
     );
     let conn = open(&scratch.path).expect("open scratch database");
     let shop = start_shop(price, behaviour).await;
-    let ntfy = start_ntfy().await;
+    let smtp = FakeSmtp::start().await;
     let fetcher = Fetcher::new(TIMEOUT, 1_048_576)
         .expect("client should build")
         .with_politeness(Politeness {
             host_interval: Duration::ZERO,
             ..Politeness::default()
         });
-    let notifier = Notifier::new(ntfy.url.clone(), None).expect("notifier should build");
+    let notifier = Notifier::unencrypted("127.0.0.1", smtp.port(), SENDER, RECIPIENT)
+        .expect("notifier should build");
     let watch_id = insert_watch(&conn, shop.product_url(1).as_str(), None);
     Fixture {
         conn,
         scratch,
         shop,
-        ntfy,
+        smtp,
         fetcher,
         notifier,
         watch_id,
@@ -405,23 +399,6 @@ async fn start_shop(price: &str, behaviour: Behaviour) -> Shop {
     }
 }
 
-/// Starts an ntfy server that answers 200 until told otherwise.
-async fn start_ntfy() -> Ntfy {
-    let listener = bind().await;
-    let url = base_url(&listener);
-    let posts = Arc::new(AtomicUsize::new(0));
-    let status = Arc::new(Mutex::new("200 OK"));
-    let shared_posts = Arc::clone(&posts);
-    let shared_status = Arc::clone(&status);
-    serve(listener, move |_head| {
-        // Counted before the answer is written, so the count is current once the client has it.
-        shared_posts.fetch_add(1, Ordering::SeqCst);
-        let answer = *shared_status.lock().unwrap();
-        reply(answer, &[], "")
-    });
-    Ntfy { url, posts, status }
-}
-
 #[tokio::test]
 async fn first_tick_stores_one_observation_and_sends_nothing() {
     let fixture = setup("first_tick", PRICE, OPEN_SHOP).await;
@@ -439,7 +416,7 @@ async fn first_tick_stores_one_observation_and_sends_nothing() {
         "the first price has nothing to compare with, so no events"
     );
     assert_eq!(observation_count(&fixture.conn, fixture.watch_id), 1);
-    assert_eq!(fixture.ntfy.posts(), 0);
+    assert_eq!(fixture.smtp.count(), 0);
 }
 
 #[tokio::test]
@@ -455,15 +432,36 @@ async fn price_drop_sends_one_message_for_both_events() {
         "a drop below every earlier price is two events"
     );
     assert_eq!(
-        fixture.ntfy.posts(),
+        fixture.smtp.count(),
         1,
-        "both events of one watch and time go in one message"
+        "both events of one watch and time go in one email"
+    );
+    let messages = fixture.smtp.messages();
+    let watch_url = fixture.shop.product_url(1);
+    assert!(
+        messages[0].data.contains(watch_url.as_str()),
+        "the email does not contain the watch URL {watch_url}: {}",
+        messages[0].data
     );
     let stored = stored_events(&fixture.conn, fixture.watch_id);
     let kinds: Vec<EventKind> = stored.iter().map(|stored| stored.event.kind).collect();
     assert!(kinds.contains(&EventKind::PriceDrop), "kinds: {kinds:?}");
     assert!(kinds.contains(&EventKind::LowestEver), "kinds: {kinds:?}");
     assert_eq!(unnotified_count(&fixture.conn, fixture.watch_id), 0);
+}
+
+#[tokio::test]
+async fn email_is_sent_from_the_sender_to_the_recipient() {
+    let fixture = setup("envelope", PRICE, OPEN_SHOP).await;
+    fixture.tick_at(T0).await;
+    set_price(&fixture.shop, DROPPED);
+    fixture.tick_at(later(T0)).await;
+
+    let messages = fixture.smtp.messages();
+
+    assert_eq!(messages.len(), 1, "one email for the drop");
+    assert_eq!(messages[0].from, SENDER);
+    assert_eq!(messages[0].recipients, [RECIPIENT]);
 }
 
 #[tokio::test]
@@ -480,9 +478,9 @@ async fn unchanged_price_on_a_later_tick_sends_nothing() {
         "the price did not move, so there is no new event"
     );
     assert_eq!(
-        fixture.ntfy.posts(),
+        fixture.smtp.count(),
         1,
-        "no second message for the same price"
+        "no second email for the same price"
     );
 }
 
@@ -506,7 +504,7 @@ async fn restart_does_not_resend_notified_events() {
     .await;
 
     assert_eq!(
-        fixture.ntfy.posts(),
+        fixture.smtp.count(),
         1,
         "the notified events must not be sent again"
     );
@@ -515,45 +513,49 @@ async fn restart_does_not_resend_notified_events() {
 
 #[tokio::test]
 async fn failed_notification_leaves_events_unnotified() {
-    let fixture = setup("ntfy_500", PRICE, OPEN_SHOP).await;
-    fixture.ntfy.answer_with("500 Internal Server Error");
+    let fixture = setup("smtp_fails", PRICE, OPEN_SHOP).await;
+    fixture.smtp.answer_data_with(TEMPORARY_FAILURE);
     fixture.tick_at(T0).await;
     set_price(&fixture.shop, DROPPED);
 
     let report = fixture.tick_at(later(T0)).await;
 
     assert_eq!(report.events, 2);
-    assert_eq!(fixture.ntfy.posts(), 1, "the failed POST was made once");
+    assert_eq!(
+        fixture.smtp.count(),
+        0,
+        "the server refused the email, so none is recorded"
+    );
     assert_eq!(
         unnotified_count(&fixture.conn, fixture.watch_id),
         2,
-        "events whose message failed stay unnotified"
+        "events whose email failed stay unnotified"
     );
 }
 
 #[tokio::test]
-async fn events_are_sent_once_after_ntfy_recovers() {
-    let fixture = setup("ntfy_recovers", PRICE, OPEN_SHOP).await;
-    fixture.ntfy.answer_with("500 Internal Server Error");
+async fn events_are_sent_once_after_smtp_recovers() {
+    let fixture = setup("smtp_recovers", PRICE, OPEN_SHOP).await;
+    fixture.smtp.answer_data_with(TEMPORARY_FAILURE);
     fixture.tick_at(T0).await;
     set_price(&fixture.shop, DROPPED);
     fixture.tick_at(later(T0)).await;
-    fixture.ntfy.answer_with("200 OK");
+    fixture.smtp.answer_data_with(ACCEPTED);
 
     fixture.tick_at(later(later(T0))).await;
 
     assert_eq!(
-        fixture.ntfy.posts(),
-        2,
-        "one failed POST and one successful retry"
+        fixture.smtp.count(),
+        1,
+        "the refused email is not recorded, and the retry is recorded once"
     );
     assert_eq!(unnotified_count(&fixture.conn, fixture.watch_id), 0);
 
     fixture.tick_at(later(later(later(T0)))).await;
 
     assert_eq!(
-        fixture.ntfy.posts(),
-        2,
+        fixture.smtp.count(),
+        1,
         "the events are not sent again once they are notified"
     );
 }
@@ -746,7 +748,7 @@ async fn tick_without_a_notifier_leaves_events_unnotified() {
     assert_eq!(report.events, 2);
     assert_eq!(report.notified, 0, "nothing is sent without a notifier");
     assert_eq!(unnotified_count(&fixture.conn, fixture.watch_id), 2);
-    assert_eq!(fixture.ntfy.posts(), 0);
+    assert_eq!(fixture.smtp.count(), 0);
 }
 
 #[tokio::test]
