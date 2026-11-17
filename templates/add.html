@@ -1,0 +1,52 @@
+{#
+  The add-watch form with an optional preview box showing what a fetch of the
+  entered page would extract. Extends the shared layout.
+#}
+{% extends "layout.html" %}
+
+{% block title %}Add a watch - haggle{% endblock %}
+
+{% block content %}
+<h1>Add a watch</h1>
+<form method="post" action="/add">
+  <label>URL
+    <input type="url" name="url" value="{{ url }}" required>
+  </label>
+  <label>Name
+    <input type="text" name="name" value="{{ name }}">
+  </label>
+  <label>CSS selector
+    <input type="text" name="selector" value="{{ selector }}">
+  </label>
+  <label>Target price
+    <input type="text" name="target" value="{{ target }}" placeholder="199.99">
+  </label>
+  <label>Check every
+    <input type="text" name="every" value="{{ every }}">
+  </label>
+  <button type="submit" formaction="/add/preview">Preview</button>
+  <button type="submit">Add</button>
+</form>
+{% if let Some(message) = preview_error %}
+<section class="preview">
+  <h2>Preview</h2>
+  <p>{{ message }}</p>
+</section>
+{% endif %}
+{% if let Some(preview) = preview %}
+<section class="preview">
+  <h2>Preview</h2>
+  <dl>
+    <dt>Price</dt><dd>{{ preview.price }}</dd>
+    {% if let Some(list_price) = preview.list_price %}
+    <dt>List price</dt><dd>{{ list_price }}</dd>
+    {% endif %}
+    <dt>Availability</dt><dd>{{ preview.availability }}</dd>
+    {% if let Some(title) = preview.title %}
+    <dt>Title</dt><dd>{{ title }}</dd>
+    {% endif %}
+    <dt>Source</dt><dd>{{ preview.source }}</dd>
+  </dl>
+</section>
+{% endif %}
+{% endblock %}

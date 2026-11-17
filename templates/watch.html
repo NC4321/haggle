@@ -1,0 +1,43 @@
+{#
+  The detail page of one watch: price chart, events, and the edit, pause and
+  delete forms. Extends the shared layout.
+#}
+{% extends "layout.html" %}
+
+{% block title %}{{ heading }} - haggle{% endblock %}
+
+{% block content %}
+<h1>{{ heading }}</h1>
+<p><a href="{{ url }}">{{ url }}</a></p>
+<dl>
+  <dt>Status</dt><dd>{{ status }}</dd>
+  <dt>Latest price</dt>
+  <dd>{% if let Some(price) = latest_price %}{{ price }}{% else %}none yet{% endif %}</dd>
+</dl>
+{{ chart|safe }}
+<h2>Events</h2>
+{% if events.is_empty() %}
+<p>No events yet.</p>
+{% else %}
+<ul>
+  {% for event in events %}
+  <li>{{ event.time }} {{ event.label }}{% if let Some((old, new)) = event.change %} {{ old }} &rarr; {{ new }}{% endif %}</li>
+  {% endfor %}
+</ul>
+{% endif %}
+<form method="post" action="/watches/{{ id }}">
+  <label>Target price
+    <input type="text" name="target" value="{{ target }}" placeholder="199.99">
+  </label>
+  <label>Check every
+    <input type="text" name="every" value="{{ every }}">
+  </label>
+  <button type="submit">Save</button>
+</form>
+<form method="post" action="/watches/{{ id }}/pause">
+  <button type="submit">{% if enabled %}Pause{% else %}Resume{% endif %}</button>
+</form>
+<form method="post" action="/watches/{{ id }}/delete">
+  <button type="submit">Delete</button>
+</form>
+{% endblock %}

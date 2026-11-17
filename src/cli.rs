@@ -1,20 +1,30 @@
 //! The command-line interface: argument definitions and the command implementations.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::future::IntoFuture;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 use time::OffsetDateTime;
 use time::macros::format_description;
+use tokio::net::TcpListener;
 use tokio::signal::unix::{Signal, SignalKind, signal};
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 
 use crate::config::{Config, ConfigError};
 use crate::db::watches;
-use crate::db::{self, DbError, NewWatch, observations};
-use crate::extract::{self, ExtractError};
-use crate::fetch::{DEFAULT_MAX_BYTES, DEFAULT_TIMEOUT, FetchError, Fetched, Fetcher, fetch};
-use crate::money::{self, MoneyError};
+use crate::db::{self, DbError, NewObservation, NewWatch, observations};
+use crate::demo_shop::{self, DemoClock, Product};
+use crate::extract::{self, ExtractError, Source};
+use crate::fetch::{
+    DEFAULT_MAX_BYTES, DEFAULT_TIMEOUT, FetchError, Fetched, Fetcher, Politeness, fetch,
+};
+use crate::money::{self, Currency, Money, MoneyError};
 use crate::notify::{Notifier, NotifyError};
 use crate::scheduler;
+use crate::web;
 
 /// Command-line arguments of the haggle binary.
 #[derive(Debug, Parser)]
@@ -70,6 +80,8 @@ pub enum Command {
     },
     /// Run the scheduler until interrupted (Ctrl-C or SIGTERM).
     Serve,
+    /// Run a fake shop with a scripted timeline and show it in the web UI, with time sped up.
+    Demo,
 }
 
 /// The check interval used when `--every` is not given.
@@ -77,6 +89,30 @@ const DEFAULT_INTERVAL: &str = "6h";
 
 /// The shortest check interval allowed, in seconds.
 const MIN_INTERVAL_SECONDS: i64 = 5 * 60;
+
+/// Demo seconds that pass per real second.
+const DEMO_SPEED: i64 = 60;
+
+/// The check interval of demo watches, in seconds.
+const DEMO_INTERVAL_SECONDS: i64 = 300;
+
+/// The kettle's target price in the demo, in euro cents.
+const DEMO_KETTLE_TARGET_MINOR: i64 = 4000;
+
+/// The slug of the demo product that gets a target price.
+const DEMO_TARGET_SLUG: &str = "kettle";
+
+/// Demo seconds between the seeded history observations.
+const DEMO_HISTORY_STEP_SECONDS: i64 = 6 * 3600;
+
+/// How far back the seeded demo history starts, in demo seconds.
+const DEMO_HISTORY_SPAN_SECONDS: i64 = 30 * 86400;
+
+/// The newest seeded demo observation, in demo seconds before now.
+const DEMO_HISTORY_END_SECONDS: i64 = 3600;
+
+/// Real time between scheduler ticks in the demo.
+const DEMO_TICK: Duration = Duration::from_secs(1);
 
 /// The format of times printed by `history`.
 const TIME_FORMAT: &[time::format_description::BorrowedFormatItem<'static>] =
@@ -105,7 +141,7 @@ pub enum CliError {
     NoSuchWatch(i64),
     #[error(transparent)]
     Notify(#[from] NotifyError),
-    #[error("cannot listen for shutdown signals: {0}")]
+    #[error("{0}")]
     Io(String),
 }
 
@@ -127,6 +163,7 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
         Command::History { id } => history(id),
         Command::Rm { id } => remove(id),
         Command::Serve => serve().await,
+        Command::Demo => demo().await,
     }
 }
 
@@ -283,14 +320,14 @@ fn remove(id: i64) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Runs the scheduler until Ctrl-C or SIGTERM.
+/// Runs the scheduler and the web interface until Ctrl-C or SIGTERM.
 async fn serve() -> Result<(), CliError> {
     // Registered before any other work so an early signal is not lost to the default handler.
     let mut interrupt = register_signal(SignalKind::interrupt())?;
     let mut terminate = register_signal(SignalKind::terminate())?;
     let config = Config::from_env()?;
     let connection = db::open(&config.db_path)?;
-    let fetcher = Fetcher::new(DEFAULT_TIMEOUT, DEFAULT_MAX_BYTES)?;
+    let fetcher = Arc::new(Fetcher::new(DEFAULT_TIMEOUT, DEFAULT_MAX_BYTES)?);
     let notifier = match &config.ntfy {
         Some(ntfy) => Some(Notifier::new(ntfy.url.clone(), ntfy.token.clone())?),
         None => {
@@ -298,6 +335,7 @@ async fn serve() -> Result<(), CliError> {
             None
         }
     };
+    let (stop_web, web_server) = start_web(&config, Arc::clone(&fetcher)).await?;
     let shutdown = async {
         tokio::select! {
             _ = interrupt.recv() => {}
@@ -306,14 +344,200 @@ async fn serve() -> Result<(), CliError> {
     };
     tracing::info!(
         db_path = %config.db_path.display(),
+        listen = %config.listen,
         ntfy = notifier.is_some(),
         "serving"
     );
-    scheduler::run(&connection, &fetcher, notifier.as_ref(), shutdown).await?;
+    let scheduled = scheduler::run(&connection, &fetcher, notifier.as_ref(), shutdown).await;
+    // The send fails only when the server has already stopped; join_web reports that exit.
+    let _ = stop_web.send(());
+    let served = join_web(web_server).await;
+    scheduled?;
+    served?;
     tracing::info!("shutting down");
     Ok(())
 }
 
+/// Opens a second database connection and starts the web interface on `config.listen`
+/// in a background task.
+///
+/// Returns the sender that stops the server and the handle of its task. Returns
+/// `CliError::Db` when the database cannot be opened, and `CliError::Io` when the
+/// address cannot be bound.
+async fn start_web(
+    config: &Config,
+    fetcher: Arc<Fetcher>,
+) -> Result<(oneshot::Sender<()>, JoinHandle<std::io::Result<()>>), CliError> {
+    let connection = db::open(&config.db_path)?;
+    let state = web::AppState {
+        db: Arc::new(Mutex::new(connection)),
+        fetcher,
+    };
+    let listener = TcpListener::bind(config.listen)
+        .await
+        .map_err(|error| CliError::Io(format!("cannot listen on {}: {error}", config.listen)))?;
+    let (stop_sender, stop_receiver) = oneshot::channel::<()>();
+    let server = tokio::spawn(web::serve(listener, state, async {
+        // A dropped sender also ends the wait, so the server stops either way.
+        let _ = stop_receiver.await;
+    }));
+    Ok((stop_sender, server))
+}
+
+/// Waits for the web server task to finish, returning its I/O error or a panic as `CliError::Io`.
+async fn join_web(server: JoinHandle<std::io::Result<()>>) -> Result<(), CliError> {
+    server
+        .await
+        .map_err(|error| CliError::Io(format!("web server task failed: {error}")))?
+        .map_err(|error| CliError::Io(format!("web server failed: {error}")))
+}
+
 fn register_signal(kind: SignalKind) -> Result<Signal, CliError> {
-    signal(kind).map_err(|error| CliError::Io(error.to_string()))
+    signal(kind)
+        .map_err(|error| CliError::Io(format!("cannot listen for shutdown signals: {error}")))
+}
+
+/// Removes the demo database and its `-wal` and `-shm` files when dropped.
+struct DemoDatabaseFiles(PathBuf);
+
+impl Drop for DemoDatabaseFiles {
+    fn drop(&mut self) {
+        for suffix in ["", "-wal", "-shm"] {
+            let mut path = self.0.clone().into_os_string();
+            path.push(suffix);
+            // The file may never have been created, so a missing file is fine.
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Runs a fake shop and the web interface on a temporary database, with sped-up time,
+/// until Ctrl-C or SIGTERM.
+async fn demo() -> Result<(), CliError> {
+    // Registered before any other work so an early signal is not lost to the default handler.
+    let mut interrupt = register_signal(SignalKind::interrupt())?;
+    let mut terminate = register_signal(SignalKind::terminate())?;
+    let db_path = std::env::temp_dir().join(format!("haggle-demo-{}.db", std::process::id()));
+    let _cleanup = DemoDatabaseFiles(db_path.clone());
+    let config = demo_config(&db_path)?;
+    println!("database: {}", db_path.display());
+    println!("dashboard: http://{}/", config.listen);
+    let connection = db::open(&config.db_path)?;
+    let clock = Arc::new(DemoClock::new(now_seconds(), DEMO_SPEED));
+    let shop_base = start_demo_shop(Arc::clone(&clock)).await?;
+    seed_demo(&connection, &shop_base, clock.now())?;
+    let fetcher = Arc::new(
+        Fetcher::new(DEFAULT_TIMEOUT, DEFAULT_MAX_BYTES)?.with_politeness(Politeness {
+            host_interval: Duration::ZERO,
+            ..Default::default()
+        }),
+    );
+    let (stop_web, web_server) = start_web(&config, Arc::clone(&fetcher)).await?;
+    let shutdown = async {
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+        }
+    };
+    let ticked = tick_until(shutdown, &connection, &fetcher, &clock).await;
+    // The send fails only when the server has already stopped; join_web reports that exit.
+    let _ = stop_web.send(());
+    let served = join_web(web_server).await;
+    ticked?;
+    served
+}
+
+/// Builds the demo configuration: the temporary database and `HAGGLE_LISTEN` from the environment.
+fn demo_config(db_path: &std::path::Path) -> Result<Config, CliError> {
+    Ok(Config::from_vars(|name| match name {
+        "HAGGLE_DB" => Some(db_path.display().to_string()),
+        other => std::env::var(other).ok(),
+    })?)
+}
+
+/// Binds the fake shop on a free local port and serves it in a background task.
+///
+/// Returns the shop's base URL, or `CliError::Io` when it cannot be bound.
+async fn start_demo_shop(clock: Arc<DemoClock>) -> Result<url::Url, CliError> {
+    let io_error =
+        |error: std::io::Error| CliError::Io(format!("cannot start the demo shop: {error}"));
+    let listener = TcpListener::bind("127.0.0.1:0").await.map_err(io_error)?;
+    let address = listener.local_addr().map_err(io_error)?;
+    tokio::spawn(axum::serve(listener, demo_shop::router(clock)).into_future());
+    url::Url::parse(&format!("http://{address}/"))
+        .map_err(|error| CliError::InvalidUrl(address.to_string(), error.to_string()))
+}
+
+/// Inserts a watch for every demo product and seeds its price history.
+fn seed_demo(
+    connection: &rusqlite::Connection,
+    shop_base: &url::Url,
+    now: i64,
+) -> Result<(), CliError> {
+    for product in demo_shop::PRODUCTS {
+        let target = (product.slug == DEMO_TARGET_SLUG).then_some(Money {
+            minor: DEMO_KETTLE_TARGET_MINOR,
+            currency: Currency::Eur,
+        });
+        let new = NewWatch {
+            url: demo_shop::url_for(shop_base, product).to_string(),
+            name: Some(product.name.to_string()),
+            selector: None,
+            target,
+            interval_s: DEMO_INTERVAL_SECONDS,
+        };
+        let watch_id = watches::insert(connection, &new, now)?;
+        seed_history(connection, watch_id, product, now)?;
+    }
+    Ok(())
+}
+
+/// Records one observation of `product` every `DEMO_HISTORY_STEP_SECONDS` of demo time
+/// before `now`, following the product's scripted timeline.
+fn seed_history(
+    connection: &rusqlite::Connection,
+    watch_id: i64,
+    product: &Product,
+    now: i64,
+) -> Result<(), DbError> {
+    let mut offset = -DEMO_HISTORY_SPAN_SECONDS;
+    while offset <= -DEMO_HISTORY_END_SECONDS {
+        let step = demo_shop::state_at(product, offset);
+        observations::insert(
+            connection,
+            &NewObservation {
+                watch_id,
+                at: now + offset,
+                price: Money {
+                    minor: step.price_minor,
+                    currency: product.currency,
+                },
+                list_price: step.list_price_minor.map(|minor| Money {
+                    minor,
+                    currency: product.currency,
+                }),
+                availability: step.availability,
+                source: Source::JsonLd,
+            },
+        )?;
+        offset += DEMO_HISTORY_STEP_SECONDS;
+    }
+    Ok(())
+}
+
+/// Runs a scheduler tick at the demo time every `DEMO_TICK` until `shutdown` completes.
+async fn tick_until(
+    shutdown: impl std::future::Future<Output = ()>,
+    connection: &rusqlite::Connection,
+    fetcher: &Fetcher,
+    clock: &DemoClock,
+) -> Result<(), CliError> {
+    tokio::pin!(shutdown);
+    loop {
+        scheduler::tick(connection, fetcher, None, clock.now()).await?;
+        tokio::select! {
+            () = &mut shutdown => return Ok(()),
+            () = tokio::time::sleep(DEMO_TICK) => {}
+        }
+    }
 }

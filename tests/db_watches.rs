@@ -486,3 +486,248 @@ fn get_of_a_row_with_an_unknown_currency_returns_corrupt() {
         other => panic!("expected DbError::Corrupt, got {other:?}"),
     }
 }
+
+/// A watch with a name, selector, a 1299 EUR target and a 15-minute interval, so each setter
+/// has a stored value to change and fields to leave alone.
+fn detailed_watch(url: &str) -> NewWatch {
+    NewWatch {
+        url: url.to_string(),
+        name: Some("Kettle".to_string()),
+        selector: Some(".price-now".to_string()),
+        target: Some(Money {
+            minor: 1299,
+            currency: Currency::Eur,
+        }),
+        interval_s: 900,
+    }
+}
+
+/// Inserts a `detailed_watch` for `https://shop.example/a` at `NOW` and returns its id.
+fn insert_detailed(conn: &Connection) -> i64 {
+    watches::insert(conn, &detailed_watch("https://shop.example/a"), NOW).expect("insert watch")
+}
+
+/// Reads the `currency` column of the watch with `id` as stored, without the target decoding.
+fn stored_currency(conn: &Connection, id: i64) -> Option<String> {
+    conn.query_row(
+        "SELECT currency FROM watches WHERE id = ?1",
+        params![id],
+        |row| row.get(0),
+    )
+    .expect("read currency column")
+}
+
+#[test]
+fn set_target_stores_the_amount_in_minor_units() {
+    let (conn, _scratch) = open_scratch("set_target_stores_the_amount_in_minor_units");
+    let id = insert_at(&conn, "https://shop.example/a", NOW);
+    // 199.99 EUR is 19999 minor units, since EUR has two decimal places.
+    let target = Money {
+        minor: 19999,
+        currency: Currency::Eur,
+    };
+
+    watches::set_target(&conn, id, Some(&target)).expect("set target");
+
+    assert_eq!(get_watch(&conn, id).target, Some(target));
+}
+
+#[test]
+fn set_target_with_another_currency_replaces_the_stored_currency() {
+    let (conn, _scratch) = open_scratch("set_target_with_another_currency_replaces_the_currency");
+    let id = insert_detailed(&conn);
+    let target = Money {
+        minor: 15000,
+        currency: Currency::Jpy,
+    };
+
+    watches::set_target(&conn, id, Some(&target)).expect("set target");
+
+    assert_eq!(get_watch(&conn, id).target, Some(target));
+    assert_eq!(stored_currency(&conn, id).as_deref(), Some("JPY"));
+}
+
+#[test]
+fn set_target_none_clears_the_target() {
+    let (conn, _scratch) = open_scratch("set_target_none_clears_the_target");
+    let id = insert_detailed(&conn);
+
+    watches::set_target(&conn, id, None).expect("set target");
+
+    assert_eq!(get_watch(&conn, id).target, None);
+}
+
+#[test]
+fn set_target_none_clears_the_currency_column() {
+    let (conn, _scratch) = open_scratch("set_target_none_clears_the_currency_column");
+    let new = NewWatch {
+        target: Some(Money {
+            minor: 15000,
+            currency: Currency::Jpy,
+        }),
+        ..new_watch("https://shop.example/yen")
+    };
+    let id = watches::insert(&conn, &new, NOW).expect("insert watch");
+
+    watches::set_target(&conn, id, None).expect("set target");
+
+    // Clearing the target also clears its currency: a currency with no amount reads back as corrupt.
+    assert_eq!(stored_currency(&conn, id), None);
+}
+
+#[test]
+fn set_target_changes_no_other_field_of_the_watch() {
+    let (conn, _scratch) = open_scratch("set_target_changes_no_other_field");
+    let id = insert_detailed(&conn);
+    let before = get_watch(&conn, id);
+    let target = Money {
+        minor: 19999,
+        currency: Currency::Eur,
+    };
+
+    watches::set_target(&conn, id, Some(&target)).expect("set target");
+
+    assert_eq!(
+        get_watch(&conn, id),
+        Watch {
+            target: Some(target),
+            ..before
+        }
+    );
+}
+
+#[test]
+fn set_target_of_an_existing_watch_returns_true() {
+    let (conn, _scratch) = open_scratch("set_target_of_an_existing_watch_returns_true");
+    let id = insert_at(&conn, "https://shop.example/a", NOW);
+    let target = Money {
+        minor: 19999,
+        currency: Currency::Eur,
+    };
+
+    let updated = watches::set_target(&conn, id, Some(&target)).expect("set target");
+
+    assert!(updated);
+}
+
+#[test]
+fn set_target_of_an_unknown_id_returns_false() {
+    let (conn, _scratch) = open_scratch("set_target_of_an_unknown_id_returns_false");
+    let target = Money {
+        minor: 19999,
+        currency: Currency::Eur,
+    };
+
+    let updated = watches::set_target(&conn, 9999, Some(&target)).expect("set target");
+
+    assert!(!updated);
+}
+
+#[test]
+fn set_target_of_an_unknown_id_leaves_existing_watches_unchanged() {
+    let (conn, _scratch) = open_scratch("set_target_of_an_unknown_id_leaves_watches_unchanged");
+    let id = insert_detailed(&conn);
+    let before = get_watch(&conn, id);
+    let target = Money {
+        minor: 19999,
+        currency: Currency::Eur,
+    };
+
+    watches::set_target(&conn, 9999, Some(&target)).expect("set target");
+
+    assert_eq!(get_watch(&conn, id), before);
+}
+
+#[test]
+fn set_interval_stores_the_new_interval() {
+    let (conn, _scratch) = open_scratch("set_interval_stores_the_new_interval");
+    let id = insert_detailed(&conn);
+
+    watches::set_interval(&conn, id, HOUR_S).expect("set interval");
+
+    assert_eq!(get_watch(&conn, id).interval_s, 3600);
+}
+
+#[test]
+fn set_interval_changes_no_other_field_of_the_watch() {
+    let (conn, _scratch) = open_scratch("set_interval_changes_no_other_field");
+    let id = insert_detailed(&conn);
+    let before = get_watch(&conn, id);
+
+    watches::set_interval(&conn, id, HOUR_S).expect("set interval");
+
+    assert_eq!(
+        get_watch(&conn, id),
+        Watch {
+            interval_s: HOUR_S,
+            ..before
+        }
+    );
+}
+
+#[test]
+fn set_interval_of_an_existing_watch_returns_true() {
+    let (conn, _scratch) = open_scratch("set_interval_of_an_existing_watch_returns_true");
+    let id = insert_detailed(&conn);
+
+    let updated = watches::set_interval(&conn, id, HOUR_S).expect("set interval");
+
+    assert!(updated);
+}
+
+#[test]
+fn set_interval_of_an_unknown_id_returns_false() {
+    let (conn, _scratch) = open_scratch("set_interval_of_an_unknown_id_returns_false");
+
+    let updated = watches::set_interval(&conn, 9999, HOUR_S).expect("set interval");
+
+    assert!(!updated);
+}
+
+#[test]
+fn set_enabled_false_then_true_toggles_enabled_both_ways() {
+    let (conn, _scratch) = open_scratch("set_enabled_false_then_true_toggles_enabled");
+    let id = insert_detailed(&conn);
+
+    watches::set_enabled(&conn, id, false).expect("disable watch");
+    assert!(!get_watch(&conn, id).enabled);
+
+    watches::set_enabled(&conn, id, true).expect("enable watch");
+    assert!(get_watch(&conn, id).enabled);
+}
+
+#[test]
+fn set_enabled_changes_no_other_field_of_the_watch() {
+    let (conn, _scratch) = open_scratch("set_enabled_changes_no_other_field");
+    let id = insert_detailed(&conn);
+    let before = get_watch(&conn, id);
+
+    watches::set_enabled(&conn, id, false).expect("disable watch");
+
+    assert_eq!(
+        get_watch(&conn, id),
+        Watch {
+            enabled: false,
+            ..before
+        }
+    );
+}
+
+#[test]
+fn set_enabled_of_an_existing_watch_returns_true() {
+    let (conn, _scratch) = open_scratch("set_enabled_of_an_existing_watch_returns_true");
+    let id = insert_detailed(&conn);
+
+    let updated = watches::set_enabled(&conn, id, false).expect("disable watch");
+
+    assert!(updated);
+}
+
+#[test]
+fn set_enabled_of_an_unknown_id_returns_false() {
+    let (conn, _scratch) = open_scratch("set_enabled_of_an_unknown_id_returns_false");
+
+    let updated = watches::set_enabled(&conn, 9999, false).expect("disable watch");
+
+    assert!(!updated);
+}

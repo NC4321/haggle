@@ -1,0 +1,102 @@
+/* Stylesheet of the haggle web interface. */
+
+:root {
+  --fg: #1d1f23; --bg: #ffffff; --muted: #6b7078; --border: #d8dbe0;
+  --accent: #2355c4; --good: #1e7d3a; --bad: #b3261e; --warn: #9a6700;
+  --gap-fill: #e6e8eb;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg: #e4e6ea; --bg: #17191c; --muted: #9aa0a8; --border: #3a3e45;
+    --accent: #8ab4ff; --good: #5fd08a; --bad: #ff8a80; --warn: #f0c060;
+    --gap-fill: #2c3036;
+  }
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, sans-serif;
+  line-height: 1.5;
+  color: var(--fg);
+  background: var(--bg);
+}
+
+a { color: var(--accent); }
+
+header {
+  display: flex;
+  align-items: baseline;
+  gap: 1.5rem;
+  padding: 1rem 1.5rem;
+  border-bottom: 1px solid var(--border);
+}
+header a { text-decoration: none; }
+header .brand { font-size: 1.2rem; font-weight: 700; }
+
+main { max-width: 60rem; margin: 0 auto; padding: 1.5rem; }
+
+table.watches { width: 100%; border-collapse: collapse; }
+table.watches th,
+table.watches td {
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: middle;
+}
+
+.num { text-align: right; font-variant-numeric: tabular-nums; }
+
+.status-ok,
+.status-needs-selector,
+.status-blocked,
+.status-error {
+  display: inline-block;
+  padding: 0.1rem 0.5rem;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  font-size: 0.85rem;
+}
+.status-ok { color: var(--good); }
+.status-needs-selector { color: var(--warn); }
+.status-blocked,
+.status-error { color: var(--bad); }
+
+.paused { color: var(--muted); font-style: italic; }
+.down { color: var(--good); }
+.up { color: var(--bad); }
+
+label { display: block; margin: 0.75rem 0 0.25rem; font-weight: 600; }
+
+input {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 30rem;
+  padding: 0.45rem 0.6rem;
+  font: inherit;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+button {
+  margin-top: 1rem;
+  padding: 0.45rem 1rem;
+  font: inherit;
+  color: var(--bg);
+  background: var(--accent);
+  border: 0;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+svg.chart,
+svg.sparkline { overflow: visible; }
+
+.price { fill: none; stroke: var(--fg); stroke-width: 2; }
+.target { fill: none; stroke: var(--good); stroke-width: 1.5; stroke-dasharray: 6 4; }
+.gap { fill: var(--gap-fill); stroke: none; }
+.label { color: var(--muted); fill: var(--muted); font-size: 0.8rem; }
+
+.empty { padding: 1rem 0; color: var(--muted); font-style: italic; }

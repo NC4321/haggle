@@ -1,0 +1,20 @@
+<!--
+Base layout that every haggle page extends: the document shell, the shared
+stylesheet link, and the header navigation. Pages fill the `content` block.
+-->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}haggle{% endblock %}</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <a class="brand" href="/">haggle</a>
+    <a href="/add">Add a watch</a>
+  </header>
+  <main>{% block content %}{% endblock %}</main>
+</body>
+</html>

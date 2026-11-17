@@ -1,0 +1,28 @@
+{#
+  The dashboard: one table row per watch with its latest price, change,
+  status and sparkline. Extends the shared layout.
+#}
+{% extends "layout.html" %}
+
+{% block title %}Watches - haggle{% endblock %}
+
+{% block content %}
+<h1>Watches</h1>
+{% if rows.is_empty() %}
+<p>No watches yet. <a href="/add">Add one</a>.</p>
+{% else %}
+<table class="watches">
+  <tbody>
+  {% for row in rows %}
+    <tr>
+      <td><a href="/watches/{{ row.id }}">{{ row.title }}</a></td>
+      <td>{{ row.latest_price }}</td>
+      <td>{% if let Some(change) = row.change %}<span class="{{ change.class }}">{{ change.text }}</span>{% endif %}</td>
+      <td><span class="status-{{ row.status_code }}">{{ row.status_code }}</span>{% if row.paused %} <span class="paused">paused</span>{% endif %}</td>
+      <td>{{ row.sparkline|safe }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endblock %}
