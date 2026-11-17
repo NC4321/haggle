@@ -1,10 +1,15 @@
-//! Tests for `haggle::fetch::fetch`, run against a local HTTP server on 127.0.0.1.
+//! Tests for `haggle::fetch::fetch` and `fetch_page`, run against a local HTTP server on 127.0.0.1.
 
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
-use haggle::fetch::{FetchError, Fetched, Fetcher, USER_AGENT, Validators, fetch};
+use haggle::fetch::{
+    FetchError, Fetched, Fetcher, Politeness, USER_AGENT, Validators, fetch, fetch_page,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio::task::JoinHandle;
 use url::Url;
 
@@ -489,4 +494,520 @@ async fn sixth_redirect_gives_network_error() {
         matches!(error, FetchError::Network(_)),
         "expected Network, got {error:?}"
     );
+}
+
+/// One hour, the default `rate_limit_pause`.
+const HOUR: Duration = Duration::from_secs(3600);
+
+/// The most robots.txt bytes the spec reads.
+const ROBOTS_CAP: usize = 500 * 1024;
+
+/// Allowance for the server reading a request a moment after the client sent it.
+const READ_SLACK: Duration = Duration::from_millis(20);
+
+/// A fetcher whose politeness is `politeness`.
+fn polite_fetcher(politeness: Politeness) -> Fetcher {
+    fetcher().with_politeness(politeness)
+}
+
+/// Default politeness with host spacing switched off, so tests do not wait.
+fn no_spacing() -> Politeness {
+    Politeness {
+        host_interval: Duration::ZERO,
+        ..Politeness::default()
+    }
+}
+
+/// The URL of `path` on the server whose base URL is `base`.
+fn at(base: &Url, path: &str) -> Url {
+    base.join(path).expect("valid url")
+}
+
+/// A 2xx robots.txt reply carrying `body`.
+fn robots_reply(body: &str) -> Vec<u8> {
+    respond(
+        "200 OK",
+        &[&content_length(body.as_bytes())],
+        body.as_bytes(),
+    )
+}
+
+/// A reply with `status` and no body.
+fn empty_reply(status: &str) -> Vec<u8> {
+    respond(status, &["Content-Length: 0"], b"")
+}
+
+/// A 429 reply, with `Retry-After` set to `seconds` when given.
+fn rate_limited_reply(retry_after: Option<&str>) -> Vec<u8> {
+    match retry_after {
+        Some(seconds) => respond(
+            "429 Too Many Requests",
+            &[&format!("Retry-After: {seconds}"), "Content-Length: 0"],
+            b"",
+        ),
+        None => empty_reply("429 Too Many Requests"),
+    }
+}
+
+/// Routes `/robots.txt` to `robots` and every other path to `page`.
+fn site(robots: Vec<u8>, page: Vec<u8>) -> impl Fn(&str) -> Vec<u8> + Send + 'static {
+    move |path: &str| {
+        if path == "/robots.txt" {
+            robots.clone()
+        } else {
+            page.clone()
+        }
+    }
+}
+
+/// One request as the recording server read it.
+struct Seen {
+    /// The request target, such as `/robots.txt`.
+    path: String,
+    /// When the server read the request head.
+    at: Instant,
+}
+
+/// Serves every connection until the test ends, answering with `route`. Each request
+/// is reported on the returned channel before its reply is written, so once a fetch
+/// has returned, every request it made is already queued there.
+async fn serve_recorded<F>(route: F) -> (Url, UnboundedReceiver<Seen>)
+where
+    F: Fn(&str) -> Vec<u8> + Send + 'static,
+{
+    let listener = bind().await;
+    let address = listener.local_addr().expect("local address");
+    let (seen_tx, seen_rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.expect("accept connection");
+            let head = read_head(&mut socket).await;
+            let path = request_path(&head).to_owned();
+            let _ = seen_tx.send(Seen {
+                path: path.clone(),
+                at: Instant::now(),
+            });
+            let _ = socket.write_all(&route(path.as_str())).await;
+            let _ = socket.shutdown().await;
+        }
+    });
+    let base = Url::parse(&format!("http://{address}/")).expect("valid url");
+    (base, seen_rx)
+}
+
+/// Every request the recording server has read and not yet handed out.
+fn drain(seen: &mut UnboundedReceiver<Seen>) -> Vec<Seen> {
+    let mut requests = Vec::new();
+    while let Ok(request) = seen.try_recv() {
+        requests.push(request);
+    }
+    requests
+}
+
+/// How many of `requests` target exactly `path`.
+fn count_to(requests: &[Seen], path: &str) -> usize {
+    requests
+        .iter()
+        .filter(|request| request.path == path)
+        .count()
+}
+
+#[test]
+fn politeness_default_is_five_seconds_one_day_and_one_hour() {
+    let politeness = Politeness::default();
+
+    assert_eq!(politeness.host_interval, Duration::from_secs(5));
+    assert_eq!(politeness.robots_ttl, Duration::from_secs(24 * 3600));
+    assert_eq!(politeness.rate_limit_pause, HOUR);
+}
+
+#[tokio::test]
+async fn page_is_fetched_when_robots_txt_is_missing() {
+    let (base, _seen) = serve_recorded(site(empty_reply("404 Not Found"), page_reply())).await;
+
+    let (html, _) =
+        expect_body(fetch_page(&polite_fetcher(no_spacing()), &at(&base, "/page"), None).await);
+
+    assert_eq!(html, PAGE);
+}
+
+#[tokio::test]
+async fn page_is_fetched_when_robots_txt_is_client_error_other_than_404() {
+    // Every 4xx for robots.txt allows all, not only 404.
+    let (base, _seen) = serve_recorded(site(empty_reply("403 Forbidden"), page_reply())).await;
+
+    let (html, _) =
+        expect_body(fetch_page(&polite_fetcher(no_spacing()), &at(&base, "/page"), None).await);
+
+    assert_eq!(html, PAGE);
+}
+
+#[tokio::test]
+async fn disallow_all_robots_blocks_page_without_requesting_it() {
+    let (base, mut seen) = serve_recorded(site(
+        robots_reply("User-agent: *\nDisallow: /\n"),
+        page_reply(),
+    ))
+    .await;
+
+    let error =
+        expect_error(fetch_page(&polite_fetcher(no_spacing()), &at(&base, "/page"), None).await);
+
+    assert!(
+        matches!(error, FetchError::Blocked),
+        "expected Blocked, got {error:?}"
+    );
+    assert_eq!(count_to(&drain(&mut seen), "/page"), 0);
+}
+
+#[tokio::test]
+async fn robots_disallowing_only_private_lets_public_page_through() {
+    let (base, _seen) = serve_recorded(site(
+        robots_reply("User-agent: *\nDisallow: /private\n"),
+        page_reply(),
+    ))
+    .await;
+
+    let (html, _) =
+        expect_body(fetch_page(&polite_fetcher(no_spacing()), &at(&base, "/public"), None).await);
+
+    assert_eq!(html, PAGE);
+}
+
+#[tokio::test]
+async fn robots_disallowing_only_private_blocks_private_page_without_requesting_it() {
+    let (base, mut seen) = serve_recorded(site(
+        robots_reply("User-agent: *\nDisallow: /private\n"),
+        page_reply(),
+    ))
+    .await;
+
+    let error =
+        expect_error(fetch_page(&polite_fetcher(no_spacing()), &at(&base, "/private"), None).await);
+
+    assert!(
+        matches!(error, FetchError::Blocked),
+        "expected Blocked, got {error:?}"
+    );
+    assert_eq!(count_to(&drain(&mut seen), "/private"), 0);
+}
+
+#[tokio::test]
+async fn robots_rule_for_another_agent_does_not_block_page() {
+    let (base, _seen) = serve_recorded(site(
+        robots_reply("User-agent: otherbot\nDisallow: /\n"),
+        page_reply(),
+    ))
+    .await;
+
+    let (html, _) =
+        expect_body(fetch_page(&polite_fetcher(no_spacing()), &at(&base, "/page"), None).await);
+
+    assert_eq!(html, PAGE);
+}
+
+#[tokio::test]
+async fn robots_disallow_is_matched_against_the_query_string() {
+    // `/page?secret=1` starts with the disallowed prefix `/page?secret`.
+    let (base, mut seen) = serve_recorded(site(
+        robots_reply("User-agent: *\nDisallow: /page?secret\n"),
+        page_reply(),
+    ))
+    .await;
+
+    let error = expect_error(
+        fetch_page(
+            &polite_fetcher(no_spacing()),
+            &at(&base, "/page?secret=1"),
+            None,
+        )
+        .await,
+    );
+
+    assert!(
+        matches!(error, FetchError::Blocked),
+        "expected Blocked, got {error:?}"
+    );
+    assert_eq!(count_to(&drain(&mut seen), "/page?secret=1"), 0);
+}
+
+#[tokio::test]
+async fn robots_disallow_within_first_500_kib_blocks_page() {
+    // The rule is the first line; 100 KiB of comment follow it, all within the cap.
+    let body = format!("User-agent: *\nDisallow: /\n{}", "#".repeat(100 * 1024));
+    let (base, _seen) = serve_recorded(site(robots_reply(&body), page_reply())).await;
+
+    let error =
+        expect_error(fetch_page(&polite_fetcher(no_spacing()), &at(&base, "/page"), None).await);
+
+    assert!(
+        matches!(error, FetchError::Blocked),
+        "expected Blocked, got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn robots_disallow_past_500_kib_is_ignored() {
+    // The comment fills past the 500 KiB the spec reads, so the Disallow line after it is
+    // never read and the page is allowed.
+    let body = format!(
+        "{}\nUser-agent: *\nDisallow: /\n",
+        "#".repeat(ROBOTS_CAP + 100 * 1024)
+    );
+    let (base, _seen) = serve_recorded(site(robots_reply(&body), page_reply())).await;
+
+    let (html, _) =
+        expect_body(fetch_page(&polite_fetcher(no_spacing()), &at(&base, "/page"), None).await);
+
+    assert_eq!(html, PAGE);
+}
+
+#[tokio::test]
+async fn robots_server_error_blocks_page_without_requesting_it() {
+    let (base, mut seen) =
+        serve_recorded(site(empty_reply("500 Internal Server Error"), page_reply())).await;
+
+    let error =
+        expect_error(fetch_page(&polite_fetcher(no_spacing()), &at(&base, "/page"), None).await);
+
+    assert!(
+        matches!(error, FetchError::Blocked),
+        "expected Blocked, got {error:?}"
+    );
+    assert_eq!(count_to(&drain(&mut seen), "/page"), 0);
+}
+
+#[tokio::test]
+async fn robots_server_error_is_not_cached() {
+    // The first robots.txt request fails with 500; later ones allow everything.
+    let robots_requests = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&robots_requests);
+    let (base, mut seen) = serve_recorded(move |path: &str| {
+        if path != "/robots.txt" {
+            return page_reply();
+        }
+        match counter.fetch_add(1, Ordering::SeqCst) {
+            0 => empty_reply("500 Internal Server Error"),
+            _ => robots_reply("User-agent: *\nAllow: /\n"),
+        }
+    })
+    .await;
+    let client = polite_fetcher(no_spacing());
+
+    let first = expect_error(fetch_page(&client, &at(&base, "/page"), None).await);
+    assert!(
+        matches!(first, FetchError::Blocked),
+        "expected Blocked, got {first:?}"
+    );
+
+    let (html, _) = expect_body(fetch_page(&client, &at(&base, "/page"), None).await);
+
+    assert_eq!(html, PAGE);
+    assert_eq!(count_to(&drain(&mut seen), "/robots.txt"), 2);
+}
+
+#[tokio::test]
+async fn unreachable_origin_gives_network_error_from_robots_fetch() {
+    let url = closed_port_url().await;
+
+    let error = expect_error(fetch_page(&polite_fetcher(no_spacing()), &url, None).await);
+
+    assert!(
+        matches!(error, FetchError::Network(_)),
+        "expected Network, got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn robots_is_fetched_once_for_two_pages_of_one_origin() {
+    let (base, mut seen) = serve_recorded(site(empty_reply("404 Not Found"), page_reply())).await;
+    let client = polite_fetcher(no_spacing());
+
+    let _ = expect_body(fetch_page(&client, &at(&base, "/a"), None).await);
+    let _ = expect_body(fetch_page(&client, &at(&base, "/b"), None).await);
+
+    assert_eq!(count_to(&drain(&mut seen), "/robots.txt"), 1);
+}
+
+#[tokio::test]
+async fn page_429_gives_rate_limited() {
+    let (base, _seen) =
+        serve_recorded(site(empty_reply("404 Not Found"), rate_limited_reply(None))).await;
+
+    let error =
+        expect_error(fetch_page(&polite_fetcher(no_spacing()), &at(&base, "/page"), None).await);
+
+    assert!(
+        matches!(error, FetchError::RateLimited),
+        "expected RateLimited, got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn paused_host_refuses_another_path_without_a_request() {
+    let (base, mut seen) =
+        serve_recorded(site(empty_reply("404 Not Found"), rate_limited_reply(None))).await;
+    let client = polite_fetcher(no_spacing());
+    let _ = fetch_page(&client, &at(&base, "/page"), None).await;
+    // Forget the requests the first call made; only the second call is checked.
+    let _ = drain(&mut seen);
+
+    let error = expect_error(fetch_page(&client, &at(&base, "/other"), None).await);
+
+    assert!(
+        matches!(error, FetchError::RateLimited),
+        "expected RateLimited, got {error:?}"
+    );
+    assert!(
+        drain(&mut seen).is_empty(),
+        "no request should reach a paused host"
+    );
+}
+
+#[tokio::test]
+async fn paused_until_is_at_least_rate_limit_pause_after_429() {
+    let (base, _seen) =
+        serve_recorded(site(empty_reply("404 Not Found"), rate_limited_reply(None))).await;
+    let client = polite_fetcher(no_spacing());
+
+    let before = Instant::now();
+    let _ = fetch_page(&client, &at(&base, "/page"), None).await;
+
+    let until = client
+        .paused_until(&at(&base, "/page"))
+        .await
+        .expect("host should be paused after a 429");
+    assert!(
+        until >= before + HOUR,
+        "paused until {until:?}, expected at least one hour after {before:?}"
+    );
+}
+
+#[tokio::test]
+async fn retry_after_longer_than_pause_sets_the_longer_pause() {
+    // Retry-After 7200 s is two hours, longer than the one-hour default pause.
+    let (base, _seen) = serve_recorded(site(
+        empty_reply("404 Not Found"),
+        rate_limited_reply(Some("7200")),
+    ))
+    .await;
+    let client = polite_fetcher(no_spacing());
+
+    let before = Instant::now();
+    let _ = fetch_page(&client, &at(&base, "/page"), None).await;
+
+    let until = client
+        .paused_until(&at(&base, "/page"))
+        .await
+        .expect("host should be paused after a 429");
+    assert!(
+        until >= before + 2 * HOUR,
+        "paused until {until:?}, expected at least two hours after {before:?}"
+    );
+}
+
+#[tokio::test]
+async fn retry_after_shorter_than_pause_keeps_the_configured_pause() {
+    // Retry-After 10 s is shorter than the one-hour pause, so the pause is still an hour.
+    let (base, _seen) = serve_recorded(site(
+        empty_reply("404 Not Found"),
+        rate_limited_reply(Some("10")),
+    ))
+    .await;
+    let client = polite_fetcher(no_spacing());
+
+    let before = Instant::now();
+    let _ = fetch_page(&client, &at(&base, "/page"), None).await;
+
+    let until = client
+        .paused_until(&at(&base, "/page"))
+        .await
+        .expect("host should be paused after a 429");
+    assert!(
+        until >= before + HOUR,
+        "paused until {until:?}, expected at least one hour after {before:?}"
+    );
+}
+
+#[tokio::test]
+async fn host_on_another_port_is_not_paused() {
+    let (paused, _paused_seen) =
+        serve_recorded(site(empty_reply("404 Not Found"), rate_limited_reply(None))).await;
+    let (open, _open_seen) = serve_recorded(site(empty_reply("404 Not Found"), page_reply())).await;
+    let client = polite_fetcher(no_spacing());
+    let _ = fetch_page(&client, &at(&paused, "/page"), None).await;
+    assert!(
+        client.paused_until(&at(&paused, "/page")).await.is_some(),
+        "the first host should be paused"
+    );
+
+    let (html, _) = expect_body(fetch_page(&client, &at(&open, "/page"), None).await);
+
+    assert_eq!(html, PAGE);
+    assert!(
+        client.paused_until(&at(&open, "/page")).await.is_none(),
+        "the second host should not be paused"
+    );
+}
+
+#[tokio::test]
+async fn request_is_sent_again_once_zero_pause_is_over() {
+    // With a zero pause the host is free again at once. The first page answers 429 and
+    // later ones answer PAGE.
+    let page_requests = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&page_requests);
+    let (base, _seen) = serve_recorded(move |path: &str| match path {
+        "/robots.txt" => empty_reply("404 Not Found"),
+        _ => match counter.fetch_add(1, Ordering::SeqCst) {
+            0 => rate_limited_reply(None),
+            _ => page_reply(),
+        },
+    })
+    .await;
+    let client = polite_fetcher(Politeness {
+        rate_limit_pause: Duration::ZERO,
+        ..no_spacing()
+    });
+    let _ = fetch_page(&client, &at(&base, "/page"), None).await;
+
+    let (html, _) = expect_body(fetch_page(&client, &at(&base, "/page"), None).await);
+
+    assert_eq!(html, PAGE);
+}
+
+#[tokio::test]
+async fn page_requests_to_one_host_are_spaced_by_host_interval() {
+    let (base, mut seen) = serve_recorded(site(empty_reply("404 Not Found"), page_reply())).await;
+    let client = polite_fetcher(Politeness {
+        host_interval: Duration::from_millis(200),
+        ..Politeness::default()
+    });
+    let _ = expect_body(fetch_page(&client, &at(&base, "/a"), None).await);
+    let _ = expect_body(fetch_page(&client, &at(&base, "/b"), None).await);
+
+    let page_reads: Vec<Instant> = drain(&mut seen)
+        .iter()
+        .filter(|request| request.path != "/robots.txt")
+        .map(|request| request.at)
+        .collect();
+    assert_eq!(page_reads.len(), 2, "expected two page requests");
+    let gap = page_reads[1].duration_since(page_reads[0]);
+    assert!(
+        gap + READ_SLACK >= Duration::from_millis(200),
+        "page requests {gap:?} apart, expected at least 200 ms"
+    );
+}
+
+#[tokio::test]
+async fn fetch_ignores_robots_and_never_requests_robots_txt() {
+    let (base, mut seen) = serve_recorded(site(
+        robots_reply("User-agent: *\nDisallow: /\n"),
+        page_reply(),
+    ))
+    .await;
+
+    let (html, _) = expect_body(fetch(&fetcher(), &at(&base, "/page"), None).await);
+
+    assert_eq!(html, PAGE);
+    assert_eq!(count_to(&drain(&mut seen), "/robots.txt"), 0);
 }
