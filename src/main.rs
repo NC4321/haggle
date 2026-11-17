@@ -3,8 +3,11 @@
 use std::process::ExitCode;
 
 use clap::Parser;
-use haggle::cli::{self, Cli};
+use haggle::cli::{self, Cli, CliError};
 use tracing_subscriber::EnvFilter;
+
+/// The exit code for configuration errors.
+const CONFIG_EXIT_CODE: u8 = 2;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -17,7 +20,10 @@ async fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("error: {error}");
-            ExitCode::from(1)
+            match error {
+                CliError::Config(_) => ExitCode::from(CONFIG_EXIT_CODE),
+                _ => ExitCode::from(1),
+            }
         }
     }
 }
