@@ -3,6 +3,7 @@
 pub mod cli;
 pub mod config;
 pub mod db;
+pub mod demo_shop;
 pub mod extract;
 pub mod fetch;
 pub mod money;
