@@ -15,7 +15,7 @@ A self-hosted price and stock watcher. You give it a product URL; it checks the 
 - JavaScript-rendered pages? → not supported. No headless browser. A watch whose page yields no price is marked `needs-selector` and shown as such.
 - Money? → integer minor units plus an ISO 4217 currency code. Never floating point.
 - Politeness? → honour robots.txt; one request at a time per host with a minimum gap; random jitter on every schedule; conditional GET (ETag / Last-Modified); exponential backoff after errors and after HTTP 429 or 503; an honest User-Agent naming the project. Default check interval 6 hours, minimum 15 minutes.
-- Notifications? → ntfy (a topic URL, optional bearer token). One notification per event, never repeated for the same event.
+- Notifications? → ntfy (a topic URL, optional bearer token). One notification per event, never repeated for the same event. Changed in M5: email through Gmail SMTP, with the Gmail account and app password shared with isp-speed-monitor (`/opt/speedtest/.env`); ntfy is removed.
 - Web UI? → server-rendered HTML with htmx for the few interactive parts. Charts are SVG drawn on the server. No Node toolchain and no JavaScript build.
 - Access control? → none. The service binds to the LAN address and is not exposed to the internet.
 - Port? → 8421 (22, 80, 3000, 4747, 8000, 8080 and 8787 are already in use on hp-server).
@@ -46,7 +46,7 @@ A self-hosted price and stock watcher. You give it a product URL; it checks the 
 - `src/extract/`: `mod.rs` (the ordered chain), `jsonld.rs`, `meta.rs`, `microdata.rs`, `selector.rs`. Input is HTML text; output is an `Extraction`. No network.
 - `src/fetch.rs`: the HTTP client, robots.txt cache, per-host limiter, conditional GET, backoff.
 - `src/rules.rs`: compares a new observation with the watch's history and returns events. Pure.
-- `src/notify.rs`: ntfy client.
+- `src/notify.rs`: email client (SMTP with STARTTLS through Gmail, via lettre).
 - `src/scheduler.rs`: picks due watches, runs fetch → extract → store → rules → notify.
 - `src/db/`: `mod.rs` (open, pragmas, migrations), `watches.rs`, `observations.rs`, `events.rs`.
 - `src/web/`: `mod.rs` (`AppState`, `WebError`, router, `serve`, shared formatting helpers), `pages.rs` (dashboard), `watch_page.rs` (watch detail and its edit, pause and delete forms), `add_page.rs` (add form with preview), `chart.rs` (price history as SVG; pure).
@@ -116,7 +116,7 @@ Environment variables, read once at startup:
 
 - `HAGGLE_DB`: database path. Required. `/mnt/database/haggle/haggle.db` on hp-server.
 - `HAGGLE_LISTEN`: listen address, default `127.0.0.1:8421`; `192.168.5.21:8421` on hp-server.
-- `HAGGLE_NTFY_URL`, `HAGGLE_NTFY_TOKEN`: notification topic and optional token. The token is a secret and lives only in the systemd environment file.
+- `GMAIL_USER`, `GMAIL_APP_PASSWORD`, `ALERT_EMAIL`: the Gmail account that sends, its app password, and the address that receives. All three set turns email on; none set turns it off with a warning; some but not all is a `ConfigError`. On hp-server they come from isp-speed-monitor's `/opt/speedtest/.env`, which `haggle.service` loads as a second `EnvironmentFile`; the password is a secret and lives only there. The server is `smtp.gmail.com:587` with STARTTLS (constants in `config.rs`).
 
 ```
 haggle serve                     run the scheduler and the web UI
@@ -130,7 +130,7 @@ haggle demo                      fake shop + temp database + UI, with time sped 
 
 ### Dependencies
 
-Runtime: tokio, axum, reqwest (rustls), scraper, rusqlite (bundled), askama, clap, serde, serde_json, url, thiserror, tracing, tracing-subscriber, time
+Runtime: tokio, axum, reqwest (rustls), scraper, rusqlite (bundled), askama, clap, serde, serde_json, url, thiserror, tracing, tracing-subscriber, time, lettre (SMTP transport, tokio, rustls, builder; no native-tls)
 Dev: none beyond the standard test harness; `cargo clippy` and `cargo fmt` from the toolchain
 
 ### Design decisions
@@ -145,6 +145,7 @@ Each line: what was chosen · the alternative · why.
 - Server-rendered HTML and SVG · a React front end · the UI is five pages; a second toolchain would outweigh it.
 - Discount measured against observed history · trusting the shop's "was" price · the shop's reference price is the thing being checked.
 - Build on hp-server · a static musl build on the workstation, copied with `scp` · one machine to build, test and run on; the binary always matches the server's glibc, and no musl C toolchain is needed. The cost is a Rust toolchain on the server and slower first builds on the i5-8500T.
+- Email through Gmail (M5) · ntfy push · the user already gets the speed monitor's alerts by email from the same account; one inbox, and one app password to rotate.
 - Plain HTML forms in M3 · htmx · every page works with full reloads; the vendored htmx script is left out until a page needs partial updates.
 
 ## Conventions
@@ -240,6 +241,18 @@ Depends on: M3
 Done when: the service has run on hp-server for 48 hours, has stored observations for at least five real items, and a restore from a backup file has been tried once.
 Note: `make install` already existed from M1, so it needed no change. The plan says the minimum check interval is 15 minutes, but the code has allowed 5 minutes since M2; the docs follow the code. Screenshots were taken with a downloaded Chromium (no project dependency). The Done-when items (48 hours on hp-server, five real items, a restore tried once) are left for the user to do on the server.
 
+### M5 · Email notifications
+
+Goal: price and stock events arrive by email from the Gmail account isp-speed-monitor uses, instead of by ntfy.
+Depends on: M4
+- [ ] Email settings (`GMAIL_USER`, `GMAIL_APP_PASSWORD`, `ALERT_EMAIL`) replace the ntfy ones, in `src/config.rs`
+- [ ] Email client with lettre: one message per watch per check (subject from the events, body with one line per event and the product link), in `src/notify.rs`, `Cargo.toml`
+- [ ] `serve` builds the email notifier and the scheduler sends through it, in `src/cli.rs`, `src/scheduler.rs`
+- [ ] Tests: settings, and a send against a local fake SMTP server; ntfy tests removed, in `tests/`
+- [ ] `haggle.service` loads `/opt/speedtest/.env`; deploy guide and README describe email, in `deploy/`, `README.md`
+
+Done when: `make check` passes, a scripted price drop in the tests produces exactly one email to the fake server, and on hp-server a real drop arrives in the inbox.
+
 ## Out of scope
 
 - JavaScript-rendered pages and headless browsers.
@@ -255,4 +268,4 @@ Note: `make install` already existed from M1, so it needed no change. The plan s
 - A shop's terms may forbid automated access. The polite defaults lower the load but do not change the terms; the README says so.
 - Building on an 8 GB, 6-core server: the first release build (tokio, axum, reqwest, bundled SQLite) takes several minutes and uses a few GB of RAM while other services run. If memory gets tight, limit parallel jobs with `cargo build -j 2`.
 - `/mnt/database` is owned by root, so creating `/mnt/database/haggle` needs sudo once, by the user.
-- Whether ntfy is self-hosted or the public ntfy.sh is not decided; the code only needs a URL.
+- Gmail limits sending (about 500 messages a day) and may throttle bursts; one email per watch per check stays far below that for a few hundred watches.
