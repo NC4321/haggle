@@ -1,0 +1,32 @@
+# systemd unit that takes a daily snapshot of the Haggle database on hp-server.
+# The snapshot uses `VACUUM INTO`, which is consistent while `haggle serve` writes
+# (the database runs in WAL mode). The newest seven snapshots are kept in
+# /mnt/database/haggle/backups; older ones are deleted only after a snapshot succeeds.
+# Needs the sqlite3 command-line tool, from the `sqlite3` apt package.
+# The timer haggle-backup.timer starts this unit each day.
+
+[Unit]
+Description=Back up the Haggle database
+RequiresMountsFor=/mnt/database/haggle
+
+[Service]
+Type=oneshot
+User=haggle
+Group=haggle
+EnvironmentFile=/etc/haggle/haggle.env
+# Double quotes wrap the script because the SQL literal needs single quotes.
+# systemd escapes: %% is a literal %, $$ is a literal $ (HAGGLE_DB comes from the environment file).
+ExecStart=/bin/sh -c "set -e; mkdir -p /mnt/database/haggle/backups; sqlite3 \"$$HAGGLE_DB\" \"VACUUM INTO '/mnt/database/haggle/backups/haggle-$$(date +%%Y%%m%%d-%%H%%M%%S).db'\"; ls -1t /mnt/database/haggle/backups/haggle-*.db | tail -n +8 | xargs -r rm --"
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# The database, its WAL files and the backups all live here; the only writable path.
+ReadWritePaths=/mnt/database/haggle

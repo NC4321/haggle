@@ -1,0 +1,14 @@
+# systemd timer that runs haggle-backup.service once a day.
+# Persistent=true runs a missed backup at the next boot; the random delay
+# spreads the start time so it does not coincide with other nightly jobs.
+
+[Unit]
+Description=Daily backup of the Haggle database
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=15min
+
+[Install]
+WantedBy=timers.target
