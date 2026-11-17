@@ -1,11 +1,15 @@
 //! The command-line interface: argument definitions and the command implementations.
 
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 use time::OffsetDateTime;
 use time::macros::format_description;
+use tokio::net::TcpListener;
 use tokio::signal::unix::{Signal, SignalKind, signal};
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 
 use crate::config::{Config, ConfigError};
 use crate::db::watches;
@@ -15,6 +19,7 @@ use crate::fetch::{DEFAULT_MAX_BYTES, DEFAULT_TIMEOUT, FetchError, Fetched, Fetc
 use crate::money::{self, MoneyError};
 use crate::notify::{Notifier, NotifyError};
 use crate::scheduler;
+use crate::web;
 
 /// Command-line arguments of the haggle binary.
 #[derive(Debug, Parser)]
@@ -105,7 +110,7 @@ pub enum CliError {
     NoSuchWatch(i64),
     #[error(transparent)]
     Notify(#[from] NotifyError),
-    #[error("cannot listen for shutdown signals: {0}")]
+    #[error("{0}")]
     Io(String),
 }
 
@@ -283,14 +288,14 @@ fn remove(id: i64) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Runs the scheduler until Ctrl-C or SIGTERM.
+/// Runs the scheduler and the web interface until Ctrl-C or SIGTERM.
 async fn serve() -> Result<(), CliError> {
     // Registered before any other work so an early signal is not lost to the default handler.
     let mut interrupt = register_signal(SignalKind::interrupt())?;
     let mut terminate = register_signal(SignalKind::terminate())?;
     let config = Config::from_env()?;
     let connection = db::open(&config.db_path)?;
-    let fetcher = Fetcher::new(DEFAULT_TIMEOUT, DEFAULT_MAX_BYTES)?;
+    let fetcher = Arc::new(Fetcher::new(DEFAULT_TIMEOUT, DEFAULT_MAX_BYTES)?);
     let notifier = match &config.ntfy {
         Some(ntfy) => Some(Notifier::new(ntfy.url.clone(), ntfy.token.clone())?),
         None => {
@@ -298,6 +303,7 @@ async fn serve() -> Result<(), CliError> {
             None
         }
     };
+    let (stop_web, web_server) = start_web(&config, Arc::clone(&fetcher)).await?;
     let shutdown = async {
         tokio::select! {
             _ = interrupt.recv() => {}
@@ -306,14 +312,55 @@ async fn serve() -> Result<(), CliError> {
     };
     tracing::info!(
         db_path = %config.db_path.display(),
+        listen = %config.listen,
         ntfy = notifier.is_some(),
         "serving"
     );
-    scheduler::run(&connection, &fetcher, notifier.as_ref(), shutdown).await?;
+    let scheduled = scheduler::run(&connection, &fetcher, notifier.as_ref(), shutdown).await;
+    // The send fails only when the server has already stopped; join_web reports that exit.
+    let _ = stop_web.send(());
+    let served = join_web(web_server).await;
+    scheduled?;
+    served?;
     tracing::info!("shutting down");
     Ok(())
 }
 
+/// Opens a second database connection and starts the web interface on `config.listen`
+/// in a background task.
+///
+/// Returns the sender that stops the server and the handle of its task. Returns
+/// `CliError::Db` when the database cannot be opened, and `CliError::Io` when the
+/// address cannot be bound.
+async fn start_web(
+    config: &Config,
+    fetcher: Arc<Fetcher>,
+) -> Result<(oneshot::Sender<()>, JoinHandle<std::io::Result<()>>), CliError> {
+    let connection = db::open(&config.db_path)?;
+    let state = web::AppState {
+        db: Arc::new(Mutex::new(connection)),
+        fetcher,
+    };
+    let listener = TcpListener::bind(config.listen)
+        .await
+        .map_err(|error| CliError::Io(format!("cannot listen on {}: {error}", config.listen)))?;
+    let (stop_sender, stop_receiver) = oneshot::channel::<()>();
+    let server = tokio::spawn(web::serve(listener, state, async {
+        // A dropped sender also ends the wait, so the server stops either way.
+        let _ = stop_receiver.await;
+    }));
+    Ok((stop_sender, server))
+}
+
+/// Waits for the web server task to finish, returning its I/O error or a panic as `CliError::Io`.
+async fn join_web(server: JoinHandle<std::io::Result<()>>) -> Result<(), CliError> {
+    server
+        .await
+        .map_err(|error| CliError::Io(format!("web server task failed: {error}")))?
+        .map_err(|error| CliError::Io(format!("web server failed: {error}")))
+}
+
 fn register_signal(kind: SignalKind) -> Result<Signal, CliError> {
-    signal(kind).map_err(|error| CliError::Io(error.to_string()))
+    signal(kind)
+        .map_err(|error| CliError::Io(format!("cannot listen for shutdown signals: {error}")))
 }
