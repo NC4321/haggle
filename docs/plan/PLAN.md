@@ -230,12 +230,12 @@ Note: Pages split into pages.rs, watch_page.rs and add_page.rs, and page tests i
 
 Goal: Haggle watches real items from the homelab.
 Depends on: M3
-- [ ] systemd unit with `ReadWritePaths=/mnt/database/haggle` and an environment file, in `deploy/haggle.service`
-- [ ] Daily backup (`VACUUM INTO`, seven kept) to `/mnt/database/haggle/backups/`, in `deploy/haggle-backup.service`, `deploy/haggle-backup.timer`
-- [ ] `make install` target, in `Makefile`
-- [ ] Install and update guide, including the toolchain setup (apt packages, rustup) and the one-time folder creation, in `deploy/README.md`
-- [ ] Extraction and scheduling design notes, in `docs/design/`
-- [ ] README screenshots and demo GIF, in `media/`
+- [ ] systemd unit with `ReadWritePaths=/mnt/database/haggle` and an environment file, in `deploy/haggle.service` (#38)
+- [ ] Daily backup (`VACUUM INTO`, seven kept) to `/mnt/database/haggle/backups/`, in `deploy/haggle-backup.service`, `deploy/haggle-backup.timer` (#39)
+- [ ] `make install` target, in `Makefile` (#40)
+- [ ] Install and update guide, including the toolchain setup (apt packages, rustup) and the one-time folder creation, in `deploy/README.md` (#41)
+- [ ] Extraction and scheduling design notes, in `docs/design/` (#42)
+- [ ] README screenshots and demo GIF, in `media/` (#43)
 
 Done when: the service has run on hp-server for 48 hours, has stored observations for at least five real items, and a restore from a backup file has been tried once.
 
