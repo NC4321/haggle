@@ -23,11 +23,12 @@ const POLL: Duration = Duration::from_millis(20);
 
 /// Variables that change how the binary reads its configuration. Every test clears them and
 /// then sets the ones it needs, so the outcome does not depend on the shell running the tests.
-const HAGGLE_VARS: [&str; 4] = [
+const CONFIG_VARS: [&str; 5] = [
     "HAGGLE_DB",
     "HAGGLE_LISTEN",
-    "HAGGLE_NTFY_URL",
-    "HAGGLE_NTFY_TOKEN",
+    "GMAIL_USER",
+    "GMAIL_APP_PASSWORD",
+    "ALERT_EMAIL",
 ];
 
 /// A running `haggle demo`. Its stdout and stderr are read in the background, so a test can wait
@@ -148,7 +149,7 @@ fn leftover_database_files(database: &Path) -> Vec<PathBuf> {
 fn demo_command(listen: &str) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_haggle"));
     command.arg("demo");
-    for name in HAGGLE_VARS {
+    for name in CONFIG_VARS {
         command.env_remove(name);
     }
     command.env("HAGGLE_LISTEN", listen);
