@@ -245,11 +245,11 @@ Note: `make install` already existed from M1, so it needed no change. The plan s
 
 Goal: price and stock events arrive by email from the Gmail account isp-speed-monitor uses, instead of by ntfy.
 Depends on: M4
-- [ ] Email settings (`GMAIL_USER`, `GMAIL_APP_PASSWORD`, `ALERT_EMAIL`) replace the ntfy ones, in `src/config.rs`
-- [ ] Email client with lettre: one message per watch per check (subject from the events, body with one line per event and the product link), in `src/notify.rs`, `Cargo.toml`
-- [ ] `serve` builds the email notifier and the scheduler sends through it, in `src/cli.rs`, `src/scheduler.rs`
-- [ ] Tests: settings, and a send against a local fake SMTP server; ntfy tests removed, in `tests/`
-- [ ] `haggle.service` loads `/opt/speedtest/.env`; deploy guide and README describe email, in `deploy/`, `README.md`
+- [ ] Email settings (`GMAIL_USER`, `GMAIL_APP_PASSWORD`, `ALERT_EMAIL`) replace the ntfy ones, in `src/config.rs` (#46)
+- [ ] Email client with lettre: one message per watch per check (subject from the events, body with one line per event and the product link), in `src/notify.rs`, `Cargo.toml` (#47)
+- [ ] `serve` builds the email notifier and the scheduler sends through it, in `src/cli.rs`, `src/scheduler.rs` (#48)
+- [ ] Tests: settings, and a send against a local fake SMTP server; ntfy tests removed, in `tests/` (#49)
+- [ ] `haggle.service` loads `/opt/speedtest/.env`; deploy guide and README describe email, in `deploy/`, `README.md` (#50)
 
 Done when: `make check` passes, a scripted price drop in the tests produces exactly one email to the fake server, and on hp-server a real drop arrives in the inbox.
 
