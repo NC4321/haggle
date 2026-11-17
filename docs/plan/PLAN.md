@@ -177,20 +177,21 @@ Note: The price-parsing tests live in tests/money.rs instead of src/money.rs, so
 
 Goal: watches are checked on a schedule and a price drop sends one notification.
 Depends on: M1
-- [ ] Database open, pragmas (WAL, foreign keys) and embedded migrations, in `src/db/mod.rs`, `migrations/` (#15)
-- [ ] Watches, observations and events queries, in `src/db/` (#16)
-- [ ] Guard that refuses a `/mnt/database` path in tests and the demo, in `src/config.rs` (#17)
-- [ ] robots.txt cache, per-host limiter, conditional GET and backoff, in `src/fetch.rs` (#18)
-- [ ] Event rules: drop, rise, target hit, lowest ever, stock changes, inflated sale, in `src/rules.rs` (#19)
-- [ ] ntfy client, in `src/notify.rs` (#20)
-- [ ] Scheduler loop with jitter and graceful shutdown, in `src/scheduler.rs` (#21)
-- [ ] `add`, `ls`, `history`, `rm` and `serve` subcommands, in `src/cli.rs` (#22)
-- [ ] Test: each rule against a hand-written history, in `src/rules.rs` (#23)
-- [ ] Test: the same event is never notified twice, including after a restart, in `tests/scheduler.rs` (#24)
-- [ ] Test: a 429 response pushes the next check back and stops requests to that host, in `tests/fetch.rs` (#25)
-- [ ] Test: a robots.txt disallow marks the watch `blocked` and sends no request, in `tests/fetch.rs` (#26)
+- [x] Database open, pragmas (WAL, foreign keys) and embedded migrations, in `src/db/mod.rs`, `migrations/` (#15)
+- [x] Watches, observations and events queries, in `src/db/` (#16)
+- [x] Guard that refuses a `/mnt/database` path in tests and the demo, in `src/config.rs` (#17)
+- [x] robots.txt cache, per-host limiter, conditional GET and backoff, in `src/fetch.rs` (#18)
+- [x] Event rules: drop, rise, target hit, lowest ever, stock changes, inflated sale, in `src/rules.rs` (#19)
+- [x] ntfy client, in `src/notify.rs` (#20)
+- [x] Scheduler loop with jitter and graceful shutdown, in `src/scheduler.rs` (#21)
+- [x] `add`, `ls`, `history`, `rm` and `serve` subcommands, in `src/cli.rs` (#22)
+- [x] Test: each rule against a hand-written history, in `src/rules.rs` (#23)
+- [x] Test: the same event is never notified twice, including after a restart, in `tests/scheduler.rs` (#24)
+- [x] Test: a 429 response pushes the next check back and stops requests to that host, in `tests/fetch.rs` (#25)
+- [x] Test: a robots.txt disallow marks the watch `blocked` and sends no request, in `tests/fetch.rs` (#26)
 
 Done when: `make check` passes and, against a local test shop, a scripted price drop produces exactly one ntfy request.
+Note: Added an `events.currency` column (old and new share it). `fetch::fetch_page` wraps `fetch` with robots.txt, per-host spacing and 429 pauses. The rule tests are in tests/rules.rs, not src/rules.rs. All events from one check go out as a single ntfy message. `serve` runs only the scheduler until M3 adds the web UI.
 
 ### M3 · Dashboard and demo
 
