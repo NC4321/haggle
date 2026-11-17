@@ -117,6 +117,45 @@ pub fn record_failure(
     Ok(())
 }
 
+/// Sets the target price of the watch with row id `id`; `None` clears the target and its currency.
+/// Returns whether a row was updated.
+///
+/// Returns `DbError::Sqlite` if the update fails.
+pub fn set_target(conn: &Connection, id: i64, target: Option<&Money>) -> Result<bool, DbError> {
+    let updated = conn.execute(
+        "UPDATE watches SET target_minor = ?1, currency = ?2 WHERE id = ?3",
+        params![
+            target.map(|target| target.minor),
+            target.map(|target| target.currency.code()),
+            id,
+        ],
+    )?;
+    Ok(updated > 0)
+}
+
+/// Sets the check interval, in seconds, of the watch with row id `id`; returns whether a row was
+/// updated.
+///
+/// Returns `DbError::Sqlite` if the update fails.
+pub fn set_interval(conn: &Connection, id: i64, interval_s: i64) -> Result<bool, DbError> {
+    let updated = conn.execute(
+        "UPDATE watches SET interval_s = ?1 WHERE id = ?2",
+        params![interval_s, id],
+    )?;
+    Ok(updated > 0)
+}
+
+/// Enables or disables the watch with row id `id`; returns whether a row was updated.
+///
+/// Returns `DbError::Sqlite` if the update fails.
+pub fn set_enabled(conn: &Connection, id: i64, enabled: bool) -> Result<bool, DbError> {
+    let updated = conn.execute(
+        "UPDATE watches SET enabled = ?1 WHERE id = ?2",
+        params![i64::from(enabled), id],
+    )?;
+    Ok(updated > 0)
+}
+
 /// Deletes the watch with row id `id`; returns whether a row was deleted.
 ///
 /// Returns `DbError::Sqlite` if the delete fails.
