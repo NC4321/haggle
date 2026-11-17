@@ -13,7 +13,7 @@ use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-use crate::config::{Config, ConfigError};
+use crate::config::{self, Config, ConfigError};
 use crate::db::watches;
 use crate::db::{self, DbError, NewObservation, NewWatch, observations};
 use crate::demo_shop::{self, DemoClock, Product};
@@ -328,10 +328,18 @@ async fn serve() -> Result<(), CliError> {
     let config = Config::from_env()?;
     let connection = db::open(&config.db_path)?;
     let fetcher = Arc::new(Fetcher::new(DEFAULT_TIMEOUT, DEFAULT_MAX_BYTES)?);
-    let notifier = match &config.ntfy {
-        Some(ntfy) => Some(Notifier::new(ntfy.url.clone(), ntfy.token.clone())?),
+    let notifier = match &config.email {
+        Some(email) => Some(Notifier::gmail(
+            config::SMTP_HOST,
+            config::SMTP_PORT,
+            &email.user,
+            &email.password,
+            &email.to,
+        )?),
         None => {
-            tracing::warn!("notifications are off: HAGGLE_NTFY_URL is not set");
+            tracing::warn!(
+                "notifications are off: GMAIL_USER, GMAIL_APP_PASSWORD and ALERT_EMAIL are not set"
+            );
             None
         }
     };
@@ -345,7 +353,7 @@ async fn serve() -> Result<(), CliError> {
     tracing::info!(
         db_path = %config.db_path.display(),
         listen = %config.listen,
-        ntfy = notifier.is_some(),
+        email = notifier.is_some(),
         "serving"
     );
     let scheduled = scheduler::run(&connection, &fetcher, notifier.as_ref(), shutdown).await;

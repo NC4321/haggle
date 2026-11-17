@@ -1,15 +1,17 @@
-//! ntfy client: turns the events of a check into a push notification and posts it.
+//! Email client: turns the events of a check into an email and sends it over SMTP.
 
 use std::time::Duration;
 
+use lettre::address::AddressError;
+use lettre::message::header::ContentType;
+use lettre::message::{Mailbox, Message as LettreMessage};
+use lettre::transport::smtp::authentication::Credentials;
+use lettre::{AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
+
 use crate::db::{Event, EventKind, Watch};
-use crate::fetch::USER_AGENT;
 
-/// Request timeout for posting to ntfy.
+/// Timeout for one SMTP exchange with the mail server.
 const NOTIFY_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// The `Priority` header value that makes ntfy alert loudly.
-const HIGH_PRIORITY: &str = "4";
 
 /// The order in which event kinds pick the lead event of a message.
 const LEAD_ORDER: [EventKind; 7] = [
@@ -22,90 +24,98 @@ const LEAD_ORDER: [EventKind; 7] = [
     EventKind::PriceRise,
 ];
 
-/// The base64 alphabet of RFC 4648, used for RFC 2047 encoded words.
-const BASE64_ALPHABET: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-/// Bits per base64 character.
-const BASE64_CHAR_BITS: u32 = 6;
-
-/// Mask selecting one base64 character's worth of bits.
-const BASE64_CHAR_MASK: u32 = 0x3F;
-
-/// Bytes per base64 group.
-const BASE64_GROUP_BYTES: usize = 3;
-
-/// Characters per base64 group, padding included.
-const BASE64_GROUP_CHARS: usize = 4;
-
 /// Why a notification could not be delivered.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum NotifyError {
-    #[error("network error: {0}")]
-    Network(String),
-    #[error("ntfy answered HTTP {0}")]
-    Status(u16),
+    #[error("bad email address: {0}")]
+    Address(String),
+    #[error("SMTP error: {0}")]
+    Transport(String),
 }
 
-/// A notification ready to be sent to ntfy.
+/// An email ready to be sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
-    /// Headline shown by the device.
-    pub title: String,
-    /// Text of the notification, one line per event.
+    /// Subject line of the email.
+    pub subject: String,
+    /// Plain text of the email: one line per event, then the watch URL.
     pub body: String,
-    /// URL opened when the notification is tapped.
-    pub click: String,
-    /// Whether the notification should alert loudly.
-    pub high_priority: bool,
 }
 
-/// Posts messages to one ntfy topic, optionally with a bearer token.
+/// Sends plain-text emails from one address to another over SMTP.
 pub struct Notifier {
-    client: reqwest::Client,
-    url: url::Url,
-    token: Option<String>,
+    transport: AsyncSmtpTransport<Tokio1Executor>,
+    from: Mailbox,
+    to: Mailbox,
 }
 
 impl Notifier {
-    /// Builds a notifier for the topic at `url`, sending `token` as a bearer token when set.
+    /// Builds a notifier that sends through the SMTP server `host`:`port`, upgrading
+    /// the connection with STARTTLS and logging in as `user` with `password`.
     ///
-    /// Returns `NotifyError::Network` when the HTTP client cannot be built.
-    pub fn new(url: url::Url, token: Option<String>) -> Result<Notifier, NotifyError> {
-        let client = reqwest::Client::builder()
-            .use_rustls_tls()
-            .user_agent(USER_AGENT)
-            .timeout(NOTIFY_TIMEOUT)
-            .build()
-            .map_err(network_error)?;
-        Ok(Notifier { client, url, token })
+    /// The emails are sent from `user` to `to`.
+    /// Returns `NotifyError::Address` when `user` or `to` is not a mailbox, and
+    /// `NotifyError::Transport` when the SMTP transport cannot be set up for `host`.
+    pub fn gmail(
+        host: &str,
+        port: u16,
+        user: &str,
+        password: &str,
+        to: &str,
+    ) -> Result<Notifier, NotifyError> {
+        let transport = AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(host)
+            .map_err(transport_error)?
+            .port(port)
+            .credentials(Credentials::new(user.to_string(), password.to_string()))
+            .timeout(Some(NOTIFY_TIMEOUT))
+            .build();
+        Notifier::with_transport(transport, user, to)
     }
 
-    /// Posts `message` to the topic.
+    /// Builds a notifier that sends from `from` to `to` through `host`:`port` with no
+    /// encryption and no login.
     ///
-    /// Returns `NotifyError::Network` when the request fails, and
-    /// `NotifyError::Status` with the code when ntfy answers with a non-2xx status.
+    /// Only for a local relay or a test server: nothing protects the traffic.
+    /// Returns `NotifyError::Address` when `from` or `to` is not a mailbox.
+    pub fn unencrypted(
+        host: &str,
+        port: u16,
+        from: &str,
+        to: &str,
+    ) -> Result<Notifier, NotifyError> {
+        let transport = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(host)
+            .port(port)
+            .timeout(Some(NOTIFY_TIMEOUT))
+            .build();
+        Notifier::with_transport(transport, from, to)
+    }
+
+    /// Sends `message` as one plain-text UTF-8 email.
+    ///
+    /// Returns `NotifyError::Transport` when the email cannot be built or the SMTP exchange fails.
     pub async fn send(&self, message: &Message) -> Result<(), NotifyError> {
-        let mut request = self
-            .client
-            .post(self.url.clone())
-            .header("Title", encode_header_value(&message.title))
-            .header("Click", message.click.as_str())
-            .header(reqwest::header::CONTENT_TYPE, "text/plain; charset=utf-8")
-            .body(message.body.clone());
-        if message.high_priority {
-            request = request.header("Priority", HIGH_PRIORITY);
-        }
-        if let Some(token) = &self.token {
-            request = request.bearer_auth(token);
-        }
-        let response = request.send().await.map_err(network_error)?;
-        let status = response.status();
-        if status.is_success() {
-            Ok(())
-        } else {
-            Err(NotifyError::Status(status.as_u16()))
-        }
+        let email = LettreMessage::builder()
+            .from(self.from.clone())
+            .to(self.to.clone())
+            .subject(message.subject.as_str())
+            .header(ContentType::TEXT_PLAIN)
+            .body(message.body.clone())
+            .map_err(transport_error)?;
+        self.transport.send(email).await.map_err(transport_error)?;
+        Ok(())
+    }
+
+    /// Pairs `transport` with the parsed `from` and `to` mailboxes.
+    fn with_transport(
+        transport: AsyncSmtpTransport<Tokio1Executor>,
+        from: &str,
+        to: &str,
+    ) -> Result<Notifier, NotifyError> {
+        Ok(Notifier {
+            transport,
+            from: parse_mailbox(from)?,
+            to: parse_mailbox(to)?,
+        })
     }
 }
 
@@ -117,16 +127,10 @@ pub fn message_for(watch: &Watch, events: &[Event]) -> Message {
         .iter()
         .find_map(|kind| events.iter().find(|event| event.kind == *kind))
         .expect("message_for needs at least one event");
-    let title = format!("{}: {}", phrase(lead.kind), watch_label(watch));
-    let body = events.iter().map(event_line).collect::<Vec<_>>().join("\n");
-    Message {
-        title,
-        body,
-        click: watch.url.clone(),
-        high_priority: events
-            .iter()
-            .any(|event| event.kind == EventKind::TargetHit),
-    }
+    let subject = format!("{}: {}", phrase(lead.kind), watch_label(watch));
+    let lines = events.iter().map(event_line).collect::<Vec<_>>().join("\n");
+    let body = format!("{lines}\n\n{}", watch.url);
+    Message { subject, body }
 }
 
 /// Returns the name shown for a watch: its name, else its URL's host, else the URL itself.
@@ -165,36 +169,13 @@ fn event_line(event: &Event) -> String {
     }
 }
 
-/// Returns `text` as a header value: unchanged when ASCII, else an RFC 2047 UTF-8 base64 encoded word.
-fn encode_header_value(text: &str) -> String {
-    if text.is_ascii() {
-        return text.to_string();
-    }
-    format!("=?UTF-8?B?{}?=", base64_encode(text.as_bytes()))
+/// Parses `text` as a mailbox, failing with `NotifyError::Address` when it is not one.
+fn parse_mailbox(text: &str) -> Result<Mailbox, NotifyError> {
+    text.parse()
+        .map_err(|error: AddressError| NotifyError::Address(format!("{text}: {error}")))
 }
 
-/// Encodes `bytes` as standard base64 with `=` padding.
-fn base64_encode(bytes: &[u8]) -> String {
-    let mut encoded = String::new();
-    for group in bytes.chunks(BASE64_GROUP_BYTES) {
-        let mut triple: u32 = 0;
-        for index in 0..BASE64_GROUP_BYTES {
-            triple = (triple << 8) | u32::from(group.get(index).copied().unwrap_or(0));
-        }
-        for index in 0..BASE64_GROUP_CHARS {
-            if index <= group.len() {
-                let shift = BASE64_CHAR_BITS * (BASE64_GROUP_CHARS - 1 - index) as u32;
-                let digit = ((triple >> shift) & BASE64_CHAR_MASK) as usize;
-                encoded.push(char::from(BASE64_ALPHABET[digit]));
-            } else {
-                encoded.push('=');
-            }
-        }
-    }
-    encoded
-}
-
-/// Maps a reqwest error to `NotifyError::Network`.
-fn network_error(error: reqwest::Error) -> NotifyError {
-    NotifyError::Network(error.to_string())
+/// Maps any lettre error to `NotifyError::Transport`.
+fn transport_error(error: impl std::fmt::Display) -> NotifyError {
+    NotifyError::Transport(error.to_string())
 }
