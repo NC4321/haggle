@@ -6,7 +6,9 @@ Know when a product's price drops or the item is back in stock.
 
 ## Overview
 
-Haggle is a self-hosted price and stock watcher: give it a product URL, and it tells you when the price drops or the item is back in stock. It is for personal use on a home server, for buying homelab, hobby and work items at their lowest price. It judges a discount against the price history it observed itself, not against the shop's own "was" price. It reads the price from the product page's HTML and does not run JavaScript or log in, so shops that render prices in the browser or block non-browser clients will not work.
+Haggle is a self-hosted price and stock watcher: give it a product URL, and it tells you when the price drops or the item is back in stock. It is for personal use on a home server, for buying homelab, hobby and work items at their lowest price. It judges a discount against the prices it has observed itself, and it flags a "sale" whose claimed "was" price its own history never reached. It reads the price from the product page's HTML and does not run JavaScript or log in, so shops that render prices in the browser or block non-browser clients will not work.
+
+![Demo run in the web UI: a price drop and a restock appear within a minute](media/demo.gif)
 
 ## Features
 
@@ -20,15 +22,15 @@ Haggle is a self-hosted price and stock watcher: give it a product URL, and it t
 - ntfy notifications: one message per check and watch, covering the events it found. Price drops and rises, a target reached, the lowest price seen, out of stock and back in stock, and an inflated sale (a "sale" that is not one) are each notified once.
 - A web dashboard, served by `haggle serve` on `HAGGLE_LISTEN`. The dashboard lists every watch with its latest price, change, status and a sparkline. A watch page has the full price chart with its target line and stock gaps, the event list, and forms to edit the target and interval, pause or resume the watch, and delete it. The add form has a Preview button that shows what would be extracted before you save. The pages are plain HTML forms with no JavaScript, and the charts are SVG drawn on the server.
 - A demo with a built-in fake shop: `make demo` or `haggle demo` runs the shop, a temporary database and the dashboard with time 60 times faster, so the whole loop is visible within a minute.
-- Running as a systemd service on the home server, with a daily database backup (planned).
+- A systemd unit and a daily database backup that keeps the newest seven copies, in [deploy/](deploy/). Running Haggle on hp-server under systemd (planned, M4).
 
 ## Quick start
 
 Prerequisites:
 
-- Rust 1.85 or newer, stable, with edition 2024 support, installed with [rustup](https://rustup.rs). Ubuntu's apt `rustc` is too old for edition 2024.
+- Rust stable with edition 2024 support (Rust 1.85 or newer), installed with [rustup](https://rustup.rs). Ubuntu's apt `rustc` is too old for edition 2024.
 - A C compiler and git. On Ubuntu, install `build-essential` and `git` from apt.
-- Linux on x86-64, the target platform.
+- Linux on x86-64. The project targets `x86_64-unknown-linux-gnu`.
 
 Clone the repository and build the release binary:
 
@@ -38,7 +40,7 @@ cd haggle
 make build
 ```
 
-The first build takes several minutes. It writes `target/release/haggle`.
+The first build compiles the dependencies and can take several minutes. It writes `target/release/haggle`.
 
 Run the demo:
 
@@ -98,6 +100,12 @@ Run the scheduler and the dashboard until Ctrl-C or SIGTERM, then open `http://1
 HAGGLE_DB=./haggle.db HAGGLE_NTFY_URL=https://ntfy.example/haggle ./target/release/haggle serve
 ```
 
+The dashboard lists every watch on one page, and each watch has its own page with the price history:
+
+![Dashboard listing three watches, each with its latest price, status and a sparkline](media/dashboard.png)
+
+![Watch page for the steel kettle with its price chart, dashed target line, event list and edit form](media/watch.png)
+
 ## Configuration
 
 Environment variables are read once at startup. `check` needs none of them.
@@ -105,13 +113,26 @@ Environment variables are read once at startup. `check` needs none of them.
 | Setting | Default | What it does |
 | --- | --- | --- |
 | `--log-level LEVEL` (flag, all commands) | `warn` | Log filter written to stderr, for example `debug` or `haggle=trace`. |
-| `HAGGLE_DB` (required by `add`, `ls`, `history`, `rm` and `serve`) | none | Path of the SQLite database file, created if it does not exist and migrated when it opens. Unset, the command exits with status 2. The planned home server uses `/mnt/database/haggle/haggle.db` (planned). |
+| `HAGGLE_DB` (required by `add`, `ls`, `history`, `rm` and `serve`) | none | Path of the SQLite database file, created if it does not exist and migrated when it opens. Unset, the command exits with status 2. The hp-server deployment uses `/mnt/database/haggle/haggle.db`, see [Deployment](#deployment). |
 | `HAGGLE_LISTEN` (`serve` and `demo`) | `127.0.0.1:8421` | Address the web UI listens on. A malformed value exits with status 2. The web UI has no login, so listen only on an address you trust. |
 | `HAGGLE_NTFY_URL` (optional) | none | ntfy topic URL for notifications. Without it, `serve` runs with notifications off. |
 | `HAGGLE_NTFY_TOKEN` (optional) | none | Bearer token for the ntfy topic. It is ignored unless `HAGGLE_NTFY_URL` is set. It is a secret. |
 | Demo database | system temporary directory | `haggle-demo-<pid>.db`, created by `demo` and deleted when it exits. `demo` ignores `HAGGLE_DB`. |
 
 Configuration errors, such as an unset `HAGGLE_DB` or a malformed `HAGGLE_LISTEN`, exit with status 2. Other errors exit with status 1.
+
+## Deployment
+
+Haggle runs on hp-server as a systemd service: `haggle serve` runs as the `haggle` user and reads its settings from `/etc/haggle/haggle.env`. A timer takes a daily backup with `VACUUM INTO` and keeps the newest seven copies. The unit files are in [deploy/](deploy/), and [deploy/README.md](deploy/README.md) covers installing, updating and restoring step by step.
+
+To update an install, pull the new code, check it and install it, then restart the service:
+
+```sh
+git pull && make check && make install
+sudo systemctl restart haggle
+```
+
+Restoring a backup replaces the database, so stop the service first; the guide has the steps. Running Haggle on hp-server is milestone M4, which is not finished yet.
 
 ## Project structure
 
@@ -141,8 +162,15 @@ haggle/
 │   └── style.css           # the web UI stylesheet
 ├── tests/                  # integration tests, one file per module
 │   └── fixtures/           # saved product pages with hand-written expected prices
-└── docs/plan/PLAN.md       # decisions, architecture and milestones
+├── deploy/                 # systemd units for the service and the daily backup
+│   └── README.md           # install, update and restore on hp-server
+├── docs/
+│   ├── design/             # design notes on extraction and scheduling
+│   └── plan/PLAN.md        # decisions, architecture and milestones
+└── media/                  # screenshots and the demo GIF
 ```
+
+The design notes are [how prices are extracted](docs/design/extraction.md) and [how checks are scheduled](docs/design/scheduling.md). The plan, with its decisions and milestones, is in [docs/plan/PLAN.md](docs/plan/PLAN.md).
 
 ## Development
 
@@ -165,14 +193,14 @@ Integration tests live in `tests/`, one file per module. Command tests are named
 
 - [x] **M1 · Read a price from a page.** `haggle check URL` prints the price, currency, availability and where it found them.
 - [x] **M2 · Watch, remember, notify.** Watches are checked on a schedule, and a price drop sends one notification.
-- [ ] **M3 · Dashboard and demo.** The web UI shows every watch with its chart, and anyone can see it work in a minute.
+- [x] **M3 · Dashboard and demo.** The web UI shows every watch with its chart, and anyone can see it work in a minute.
 - [ ] **M4 · Running on hp-server.** Haggle watches real items from the homelab.
 
 The decisions, architecture and task list of each milestone are in [docs/plan/PLAN.md](docs/plan/PLAN.md).
 
 ## Contributing
 
-This repository is built milestone by milestone with agent-board. Each milestone has one branch, `board/m<k>-<name>` (for example `board/m3-dashboard-and-demo`), with one commit per card, and one pull request into `main` once its checks are green. Humans review and merge. Merges are squash merges, and merged branches are deleted.
+This repository is built milestone by milestone with agent-board. Each milestone has one branch, `board/m<k>-<name>` (for example `board/m4-running-on-hp`), with one commit per card, and one pull request into `main` once its checks are green. Humans review and merge. Merges are squash merges, and merged branches are deleted.
 
 Before you open a pull request, run the checks yourself. There is no CI yet, so `make check` is the gate:
 
